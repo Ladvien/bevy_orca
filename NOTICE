@@ -1,0 +1,27 @@
+bevy_orca
+Copyright (c) 2026 C. Thomas Brittain
+
+This product includes software derived from RVO2, the reference implementation of
+Optimal Reciprocal Collision Avoidance:
+
+    RVO2 Library
+    Copyright 2008 University of North Carolina at Chapel Hill
+    Licensed under the Apache License, Version 2.0
+    https://gamma.cs.unc.edu/RVO2/
+
+The ORCA half-plane construction and the three-stage linear program in `src/lib.rs`
+follow that implementation closely enough that its identifiers are deliberately kept —
+`linear_program1` / `linear_program2` / `linear_program3`, `t_left` / `t_right`, and
+`RVO_EPSILON` (here `EPSILON`) — so the two can be read side by side.
+
+The algorithms are described in:
+
+    J. van den Berg, M. Lin and D. Manocha,
+    "Reciprocal Velocity Obstacles for Real-Time Multi-Agent Navigation",
+    IEEE International Conference on Robotics and Automation, 2008.
+    DOI 10.1109/ROBOT.2008.4543489
+
+    J. van den Berg, S. J. Guy, M. Lin and D. Manocha,
+    "Reciprocal n-Body Collision Avoidance",
+    Robotics Research: The 14th International Symposium ISRR, 2011.
+    DOI 10.1109/TRO.2011.2120810
