@@ -1,0 +1,24 @@
+[package]
+name = "bevy_orca"
+version = "0.1.0"
+edition = "2024"
+description = "Reciprocal Velocity Obstacles (ORCA) local collision avoidance on bevy_math's Vec2 — the 2-D linear program, no ECS."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Ladvien/bevy_orca"
+keywords = ["bevy", "gamedev", "ai", "navigation", "collision-avoidance"]
+categories = ["game-development", "simulation"]
+publish = false
+
+# **`bevy_math`, not `bevy`, and the feature set is copied from `bevy_internal` on purpose.**
+#
+# This crate needs one type (`Vec2`) and no ECS at all, so depending on the whole engine would make a
+# 350-line linear program cost a renderer. The exact features matter beyond tidiness: `bevy_math`'s
+# DEFAULTS turn on `std`, which turns on `glam/std` — swapping glam's transcendentals from libm to
+# std's. Those feed `Quat::from_rotation_*` -> hashed `Transform`s -> the game's replay goldens.
+# Matching `bevy_internal-0.19.0/Cargo.toml`'s selection means this crate contributes no feature the
+# graph did not already have, so no golden can move because a solver changed crates.
+#
+# (In the parent workspace `glam/std` is already on via `avian3d`, so the union is unchanged either
+# way — but a crate that is meant to stand alone should ask for the minimum it actually needs.)
+[dependencies]
+bevy_math = { version = "0.19.0", default-features = false, features = ["nostd-libm"] }
