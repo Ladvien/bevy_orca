@@ -1,0 +1,51 @@
+# CI for the standalone `bevy_orca` mirror.
+#
+# **This path is inert upstream and live here.** GitHub only reads workflows from `.github/` at a
+# repository root, so in the monorepo this file is an ordinary text file that nothing runs. The
+# `git subtree split` that produces the mirror lifts `crates/bevy_orca/` to the root — and this file
+# with it — so it becomes the mirror's CI without the monorepo gaining a second workflow.
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (standalone) + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The crate itself needs none of these — it is `bevy_math` and a linear program. They are here
+      # for the `circle_swap` example, whose dev-dependency is the full Bevy umbrella.
+      - name: Install Bevy build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev libudev-dev libwayland-dev libxkbcommon-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # **The load-bearing step, and it is `build` rather than `test` deliberately.**
+      #
+      # `cargo test` compiles dev-dependencies, and this crate's dev-dependency is the FULL `bevy`
+      # umbrella. Cargo unifies features across a build, so under `cargo test` this crate silently
+      # receives every Bevy feature there is — including `glam/std`, which the manifest is explicit
+      # about NOT asking for, because it swaps glam's transcendentals from libm to std's. A plain
+      # `cargo build` takes no dev-dependencies and so compiles the feature set a consumer gets.
+      #
+      # A sibling crate shipped a hole exactly here: it named a type behind a feature it never
+      # declared, every test passed, and the published crate did not compile for anyone.
+      - name: Build with only the declared features
+        run: cargo build --release
+
+      - name: Test
+        run: cargo test
+
+      - name: Build examples
+        run: cargo build --examples

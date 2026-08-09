@@ -22,3 +22,14 @@ publish = false
 # way — but a crate that is meant to stand alone should ask for the minimum it actually needs.)
 [dependencies]
 bevy_math = { version = "0.19.0", default-features = false, features = ["nostd-libm"] }
+
+# **Examples only.** The crate itself takes `bevy_math` and nothing else — that is the point of it, and
+# `tests/leaf.rs` enforces it by reading `[dependencies]` only, deliberately. The `circle_swap` example
+# needs a window and a 2D camera to show the solver working, so it takes the full umbrella here, where
+# it cannot reach a consumer's dependency graph.
+#
+# Note the feature argument in `[dependencies]` above still holds: a dev-dependency turns on `glam/std`
+# when this crate's own tests or examples are built, but the parent workspace already has it on via
+# `avian3d`, so the union it contributes is unchanged and no golden moves.
+[dev-dependencies]
+bevy = { version = "0.19.0" }
