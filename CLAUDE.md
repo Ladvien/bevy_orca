@@ -26,6 +26,7 @@ cargo test                   # in a standalone checkout
 ## Rules
 
 - **Bevy 0.19 is pinned.** Read the vendored source (`~/.cargo/registry/src/index.crates.io-*/bevy_math-0.19.0/src/`), not bevy.org — that documents `main` and has been wrong for this pin more than once.
+- Consult Bevy documentation often. It can be found at codex_fs/offline_reference_docs/bevy-0.19-book/
 - **No `unwrap()`**, no `expect` on caller data, no indexing that can panic. This runs in an inner loop over every agent every tick.
 - **One path per feature.** No fallbacks, no legacy shims, no stub placeholders. If the LP cannot find a feasible velocity, return that honestly — do not substitute a degraded answer.
 
