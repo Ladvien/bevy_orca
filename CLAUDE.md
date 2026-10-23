@@ -4,7 +4,7 @@ ORCA local collision avoidance: the 2-D linear program over discs, on `bevy_math
 
 ## Source of truth
 
-The source of truth for this crate is [`Ladvien/foundation_vs_slop`](https://github.com/Ladvien/foundation_vs_slop) at `crates/bevy_orca/`. If you are reading this in a standalone `Ladvien/bevy_orca` checkout, that is a read-only `git subtree split` mirror — **changes made here cannot be pulled back**. Make them upstream.
+This repository, [`Ladvien/bevy_orca`](https://github.com/Ladvien/bevy_orca), is canonical since 2026-10-23: it moved to Bevy 0.20 while `foundation_vs_slop/crates/bevy_orca` stays frozen on 0.19. Do not mirror over it with `scripts/mirror_crates.sh`. MIT OR Apache-2.0.
 
 ## Build and test
 
@@ -25,11 +25,10 @@ cargo test                   # in a standalone checkout
 
 ## Rules
 
-- **Bevy 0.19 is pinned.** Read the vendored source (`~/.cargo/registry/src/index.crates.io-*/bevy_math-0.19.0/src/`), not bevy.org — that documents `main` and has been wrong for this pin more than once.
-- Consult Bevy documentation often. It can be found at codex_fs/offline_reference_docs/bevy-0.19-book/
+- **Bevy 0.20 is pinned.** Read the vendored source (`~/.cargo/registry/src/index.crates.io-*/bevy_math-0.20.0/src/`), not bevy.org — that documents `main` and has been wrong for this pin more than once.
 - **No `unwrap()`**, no `expect` on caller data, no indexing that can panic. This runs in an inner loop over every agent every tick.
 - **One path per feature.** No fallbacks, no legacy shims, no stub placeholders. If the LP cannot find a feasible velocity, return that honestly — do not substitute a degraded answer.
 
 ## In the monorepo
 
-The game reaches this as `crate::orca` (`src/lib.rs:119`). The root `CLAUDE.md` and `TESTING.md` carry the project-wide rules; neither is part of this mirror.
+The game reaches this as `crate::orca` in its monorepo, `foundation_vs_slop/crates/bevy_orca/`, which is frozen on Bevy 0.19. This repository is where changes land; the monorepo copy is not updated. Do not push over this repository from the monorepo's `scripts/mirror_crates.sh`.
