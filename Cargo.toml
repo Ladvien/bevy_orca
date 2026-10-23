@@ -15,13 +15,14 @@ publish = false
 # 350-line linear program cost a renderer. The exact features matter beyond tidiness: `bevy_math`'s
 # DEFAULTS turn on `std`, which turns on `glam/std` — swapping glam's transcendentals from libm to
 # std's. Those feed `Quat::from_rotation_*` -> hashed `Transform`s -> the game's replay goldens.
-# Matching `bevy_internal-0.19.0/Cargo.toml`'s selection means this crate contributes no feature the
-# graph did not already have, so no golden can move because a solver changed crates.
+# `bevy_internal-0.20.0/Cargo.toml` selects `bevy_reflect` and `nostd-libm` on `bevy_math`. This crate takes
+# `nostd-libm` only, a subset, so it still contributes no feature the graph did not already have, and no golden
+# can move because a solver changed crates.
 #
 # (In the parent workspace `glam/std` is already on via `avian3d`, so the union is unchanged either
 # way — but a crate that is meant to stand alone should ask for the minimum it actually needs.)
 [dependencies]
-bevy_math = { version = "0.19.0", default-features = false, features = ["nostd-libm"] }
+bevy_math = { version = "0.20.0", default-features = false, features = ["nostd-libm"] }
 
 # **Examples only.** The crate itself takes `bevy_math` and nothing else — that is the point of it, and
 # `tests/leaf.rs` enforces it by reading `[dependencies]` only, deliberately. The `circle_swap` example
@@ -32,4 +33,4 @@ bevy_math = { version = "0.19.0", default-features = false, features = ["nostd-l
 # when this crate's own tests or examples are built, but the parent workspace already has it on via
 # `avian3d`, so the union it contributes is unchanged and no golden moves.
 [dev-dependencies]
-bevy = { version = "0.19.0" }
+bevy = { version = "0.20.0" }

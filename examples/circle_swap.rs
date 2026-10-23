@@ -63,7 +63,7 @@ fn main() {
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
                 title: "bevy_orca — 28 agents, one contested centre".into(),
-                // 0.19 takes physical pixels as `u32` — there is no `(f32, f32)` conversion.
+                // 0.20 takes physical pixels as `u32` — there is no `(f32, f32)` conversion.
                 resolution: (860u32, 860u32).into(),
                 ..default()
             }),
@@ -212,7 +212,7 @@ fn spawn_legend(commands: &mut Commands) {
             for (i, line) in lines.into_iter().enumerate() {
                 p.spawn((
                     Text::new(line),
-                    // 0.19 makes `font_size` a `FontSize` enum rather than a bare f32.
+                    // 0.20 makes `font_size` a `FontSize` enum rather than a bare f32.
                     TextFont { font_size: FontSize::Px(if i == 0 { 14.0 } else { 12.0 }), ..default() },
                     TextColor(if i == 0 {
                         Color::srgb(1.0, 0.93, 0.78)

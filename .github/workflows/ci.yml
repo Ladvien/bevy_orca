@@ -1,9 +1,4 @@
-# CI for the standalone `bevy_orca` mirror.
-#
-# **This path is inert upstream and live here.** GitHub only reads workflows from `.github/` at a
-# repository root, so in the monorepo this file is an ordinary text file that nothing runs. The
-# `git subtree split` that produces the mirror lifts `crates/bevy_orca/` to the root — and this file
-# with it — so it becomes the mirror's CI without the monorepo gaining a second workflow.
+# CI for bevy_orca (canonical repository).
 name: CI
 
 on:
