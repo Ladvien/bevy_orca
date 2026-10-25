@@ -1,0 +1,385 @@
+//! **A whole crowd, solved as one batch.**
+//!
+//! [`new_velocity_in`] solves one agent against a neighbour slice the caller assembled. Every host
+//! that owns a crowd then writes the same four things around it — a spatial hash to find neighbours
+//! (an O(n²) scan does not survive a few hundred agents), a reused [`OrcaScratch`], a tie-break that
+//! is deterministic when two agents want the same space, and the wall buffer. This module is that
+//! ring, once, so a host learns it once.
+//!
+//! The caller still decides the two things that are gameplay: **who is a neighbour**
+//! (`solve`'s `sees`) and **what is solid** (its `walls`). This module never looks at a game type.
+
+use std::collections::HashMap;
+
+use bevy_math::Vec2;
+
+use crate::{Agent, OrcaScratch, new_velocity_in};
+
+/// One member of a crowd, as the batch solver sees it.
+///
+/// `Vec2` is the host's ground plane, in the host's units: the crate never converts.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect))]
+pub struct CrowdMember {
+    /// The caller's stable id for this member. It breaks a tie between two equidistant neighbours and
+    /// picks which side of an exact head-on meeting this member steps to, so an identical world solves
+    /// identically however the members are ordered in the input slice.
+    pub key: u64,
+    /// Position on the ground plane.
+    pub pos: Vec2,
+    /// Current velocity.
+    pub vel: Vec2,
+    /// Body radius.
+    pub radius: f32,
+    /// Speed ceiling for the solved velocity.
+    pub max_speed: f32,
+    /// Where this member wants to go.
+    ///
+    /// `None` means another system moves this member this step: it is a neighbour to everyone else and
+    /// is never solved for. Its velocity is still read, so the agent that is moving it is avoided.
+    pub pref_vel: Option<Vec2>,
+}
+
+/// How a crowd is solved. There is no [`Default`]: [`CrowdParams::neighbour_range`] is in the caller's
+/// own units, so a default would be a number from nowhere.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect))]
+pub struct CrowdParams {
+    /// Seconds of collision lookahead. Larger is more cautious and earlier; too large stalls a crowd
+    /// by braking for a congestion that has not happened yet.
+    pub time_horizon: f32,
+    /// Only members this close are neighbours, in the host's units. It is also the width of the
+    /// spatial-hash cell, so a much larger value costs more candidates per lookup.
+    pub neighbour_range: f32,
+    /// At most this many neighbours per member, nearest first.
+    pub max_neighbours: usize,
+    /// Sideways kick, as a fraction of the wish, applied when a member has any neighbour at all. It
+    /// breaks the exact symmetry of a head-on meeting, which the linear program has no reason to
+    /// prefer either way and will otherwise stall.
+    pub nudge: f32,
+}
+
+impl CrowdParams {
+    /// Parameters for a crowd whose neighbours are within `neighbour_range` of each other: a 2-second
+    /// horizon, at most 10 neighbours and a 5% nudge.
+    pub fn new(neighbour_range: f32) -> Self {
+        Self { time_horizon: 2.0, neighbour_range, max_neighbours: 10, nudge: 0.05 }
+    }
+}
+
+/// A reusable crowd solver: the spatial hash, the line buffers and the output slice.
+///
+/// Own one per crowd and call [`solve`](Self::solve) every tick. Nothing in it is per-member state, so
+/// it is safe to solve several crowds with one `Crowd`, one after the other.
+#[derive(Debug, Default)]
+pub struct Crowd {
+    scratch: OrcaScratch,
+    /// Spatial hash of member indices, `neighbour_range` per cell. Lookup only: every candidate list
+    /// is sorted before use, so no result depends on this map's iteration order.
+    cells: HashMap<(i32, i32), Vec<usize>>,
+    /// Reused candidate buffer: `(distance, key, index)`, sorted nearest-first.
+    near: Vec<(f32, u64, usize)>,
+    /// Reused neighbour slice handed to the solver.
+    neighbours: Vec<Agent>,
+    /// Reused wall buffer, filled by the caller's `walls` closure.
+    walls: Vec<(Vec2, f32)>,
+    /// Reused output, indexed like the members slice.
+    out: Vec<Option<Vec2>>,
+}
+
+/// One cell of the spatial hash, or `None` when the position is not finite.
+fn cell_of(pos: Vec2, range: f32) -> Option<(i32, i32)> {
+    if !pos.is_finite() || range.is_nan() || range <= 0.0 {
+        return None;
+    }
+    Some(((pos.x / range).floor() as i32, (pos.y / range).floor() as i32))
+}
+
+/// The SplitMix64 output mix. A stable hash of the caller's key, so the side a head-on member steps to
+/// is a property of that member and not of the tick.
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = x;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+impl Crowd {
+    /// Solve every steered member of `members` for one step of `dt`.
+    ///
+    /// The returned slice is indexed like `members`. `None` means that member was not solved: it has no
+    /// finite [`pref_vel`](CrowdMember::pref_vel), or its position is not finite.
+    ///
+    /// `sees(i, j)` decides whether member `i` treats member `j` as a neighbour at all — the host's
+    /// gameplay rule (same storey, same team, can see through a door). `walls(i, &mut buf)` fills
+    /// member `i`'s wall half-planes, exactly as [`new_velocity_in`] takes them; the buffer it is
+    /// handed is cleared first and reused afterwards.
+    pub fn solve(
+        &mut self,
+        members: &[CrowdMember],
+        params: &CrowdParams,
+        dt: f32,
+        mut sees: impl FnMut(usize, usize) -> bool,
+        mut walls: impl FnMut(usize, &mut Vec<(Vec2, f32)>),
+    ) -> &[Option<Vec2>] {
+        let range = params.neighbour_range;
+        let search = range > 0.0 && range.is_finite();
+
+        // Rebuild the hash. Each cell's list is cleared rather than dropped, so a crowd that stays in
+        // the same place tick after tick stops allocating once the map is wide enough.
+        for list in self.cells.values_mut() {
+            list.clear();
+        }
+        for (i, m) in members.iter().enumerate() {
+            let Some(cell) = cell_of(m.pos, range).filter(|_| search) else {
+                continue;
+            };
+            self.cells.entry(cell).or_default().push(i);
+        }
+
+        self.out.clear();
+        self.out.resize(members.len(), None);
+
+        for i in 0..members.len() {
+            let m = members[i];
+            let (Some(pref), true) = (m.pref_vel, m.pos.is_finite()) else {
+                continue;
+            };
+            if !pref.is_finite() {
+                continue;
+            }
+
+            // Neighbours: every member within `range` that this one sees, nearest first, at most
+            // `max_neighbours` of them. Sorting by `(distance, key)` is what makes the result a
+            // property of the world rather than of the input slice's order.
+            self.near.clear();
+            if search && let Some((cx, cy)) = cell_of(m.pos, range) {
+                for dx in -1..=1 {
+                    for dy in -1..=1 {
+                        let Some(list) = self.cells.get(&(cx + dx, cy + dy)) else {
+                            continue;
+                        };
+                        for &j in list {
+                            if j == i {
+                                continue;
+                            }
+                            let other = members[j];
+                            let dist = other.pos.distance(m.pos);
+                            if dist > range {
+                                continue;
+                            }
+                            if sees(i, j) {
+                                self.near.push((dist, other.key, j));
+                            }
+                        }
+                    }
+                }
+            }
+            self.near.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+            let keep = params.max_neighbours.min(self.near.len());
+
+            self.neighbours.clear();
+            for &(_, _, j) in &self.near[..keep] {
+                let other = members[j];
+                self.neighbours.push(Agent {
+                    pos: other.pos,
+                    vel: other.vel,
+                    radius: other.radius,
+                    // A member nobody steers is not assumed to step aside, so this one takes the full
+                    // avoidance against it instead of walking through it.
+                    avoids: other.pref_vel.is_some(),
+                });
+            }
+
+            // The wish, nudged sideways when anyone is near. The side is the member's own, hashed from
+            // its key, so two agents meeting head-on do not both pick the same side.
+            let wish = if keep == 0 {
+                pref
+            } else {
+                let side = if splitmix64(m.key) & 1 == 0 { 1.0 } else { -1.0 };
+                pref + pref.perp() * (params.nudge * side)
+            };
+
+            self.walls.clear();
+            walls(i, &mut self.walls);
+
+            let me = Agent { pos: m.pos, vel: m.vel, radius: m.radius, avoids: true };
+            let solved = new_velocity_in(
+                &mut self.scratch,
+                &me,
+                wish,
+                &self.neighbours,
+                &self.walls,
+                params.time_horizon,
+                dt,
+                m.max_speed,
+            );
+            self.out[i] = Some(solved);
+        }
+
+        &self.out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn member(key: u64, pos: Vec2, vel: Vec2, pref: Option<Vec2>) -> CrowdMember {
+        CrowdMember { key, pos, vel, radius: 0.5, max_speed: 1.5, pref_vel: pref }
+    }
+
+    /// Two members walking at each other must not pass through one another: reciprocity divides the
+    /// avoidance, and this is what "divided" has to mean in metres.
+    #[test]
+    fn head_on_members_keep_their_distance() {
+        let params = CrowdParams::new(4.0);
+        let mut crowd = Crowd::default();
+        let (mut a, mut b) = (
+            member(1, Vec2::new(-2.0, 0.0), Vec2::new(1.0, 0.0), Some(Vec2::X)),
+            member(2, Vec2::new(2.0, 0.0), Vec2::new(-1.0, 0.0), Some(-Vec2::X)),
+        );
+        let dt = 1.0 / 60.0;
+        let mut min_gap = f32::INFINITY;
+        for _ in 0..240 {
+            let members = [a, b];
+            let solved = crowd.solve(&members, &params, dt, |_, _| true, |_, buf| buf.clear());
+            if let Some(v) = solved[0] {
+                a.vel = v;
+            }
+            if let Some(v) = solved[1] {
+                b.vel = v;
+            }
+            a.pos += a.vel * dt;
+            b.pos += b.vel * dt;
+            min_gap = min_gap.min(a.pos.distance(b.pos));
+        }
+        let sum_radii = a.radius + b.radius;
+        assert!(
+            min_gap >= sum_radii - 0.05,
+            "members closed to {min_gap}, inside the {sum_radii} summed radii"
+        );
+    }
+
+    /// An unsteered member is never solved for, and the steered one takes the *full* avoidance against
+    /// it rather than half — otherwise the pair drifts through each other.
+    #[test]
+    fn an_unsteered_member_is_not_moved_and_is_avoided() {
+        let params = CrowdParams::new(4.0);
+        let mut crowd = Crowd::default();
+        let still = member(7, Vec2::new(0.0, 0.0), Vec2::ZERO, None);
+        let mover = member(8, Vec2::new(-1.5, 0.0), Vec2::new(1.0, 0.0), Some(Vec2::X));
+        let members = [still, mover];
+        let solved = crowd.solve(&members, &params, 1.0 / 60.0, |_, _| true, |_, buf| buf.clear());
+        assert_eq!(solved[0], None, "an unsteered member must not be solved for");
+        let v = solved[1].expect("the steered member is solved");
+        assert!(v.is_finite());
+        assert!((v - Vec2::X).length() > 1.0e-3, "expected avoidance, got {v}");
+    }
+
+    /// `sees` is the host's rule, and a `false` from it means the two genuinely ignore each other.
+    #[test]
+    fn a_hidden_member_is_ignored() {
+        let params = CrowdParams::new(4.0);
+        let mut crowd = Crowd::default();
+        let a = member(1, Vec2::new(-1.0, 0.0), Vec2::new(1.0, 0.0), Some(Vec2::X));
+        let b = member(2, Vec2::new(1.0, 0.0), Vec2::new(-1.0, 0.0), Some(-Vec2::X));
+        let members = [a, b];
+        let solved = crowd.solve(&members, &params, 1.0 / 60.0, |i, j| i == j, |_, buf| buf.clear());
+        for (i, v) in solved.iter().enumerate() {
+            let v = v.expect("both are steered");
+            let pref = if i == 0 { Vec2::X } else { -Vec2::X };
+            assert!(
+                (v - pref).length() < 1.0e-4,
+                "member {i} should ignore the other and keep {pref}, got {v}"
+            );
+        }
+    }
+
+    /// Shuffling the input slice must not change what any member does, because the caller's iteration
+    /// order is an ECS query's business and the simulation has to be reproducible regardless.
+    #[test]
+    fn results_do_not_depend_on_member_order() {
+        let params = CrowdParams::new(4.0);
+        let members: Vec<CrowdMember> = (0..8)
+            .map(|i| {
+                let angle = (i as f32) * std::f32::consts::TAU / 8.0;
+                member(
+                    i as u64,
+                    Vec2::new(angle.cos(), angle.sin()) * 1.2,
+                    Vec2::ZERO,
+                    Some(Vec2::new(angle.cos(), angle.sin())),
+                )
+            })
+            .collect();
+
+        let mut reference = Crowd::default();
+        let base: Vec<(u64, Option<Vec2>)> = reference
+            .solve(&members, &params, 1.0 / 60.0, |_, _| true, |_, buf| buf.clear())
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (members[i].key, *v))
+            .collect();
+
+        // A fixed permutation (reverse, then rotate by three) — deterministic, like everything else.
+        let order: Vec<usize> =
+            (0..members.len()).map(|i| (members.len() - 1 - i + 3) % members.len()).collect();
+        let shuffled: Vec<CrowdMember> = order.iter().map(|&i| members[i]).collect();
+
+        let mut other = Crowd::default();
+        let got = other.solve(&shuffled, &params, 1.0 / 60.0, |_, _| true, |_, buf| buf.clear());
+        for (k, &member) in shuffled.iter().enumerate() {
+            let expect = base.iter().find(|(key, _)| *key == member.key).expect("a key per member").1;
+            let actual = got[k];
+            match (expect, actual) {
+                (Some(a), Some(b)) => {
+                    assert_eq!(
+                        a.x.to_bits(),
+                        b.x.to_bits(),
+                        "key {}: x differs under reordering",
+                        member.key
+                    );
+                    assert_eq!(
+                        a.y.to_bits(),
+                        b.y.to_bits(),
+                        "key {}: y differs under reordering",
+                        member.key
+                    );
+                }
+                (None, None) => {}
+                _ => panic!("key {}: solved for in one order and not the other", member.key),
+            }
+        }
+    }
+
+    /// A degenerate range must not mean "everyone is a neighbour" — it means no neighbour at all.
+    #[test]
+    fn a_bad_range_leaves_members_alone() {
+        let a = member(1, Vec2::new(-0.1, 0.0), Vec2::new(1.0, 0.0), Some(Vec2::X));
+        let b = member(2, Vec2::new(0.1, 0.0), Vec2::new(-1.0, 0.0), Some(-Vec2::X));
+        let members = [a, b];
+        for range in [0.0_f32, -1.0, f32::NAN] {
+            let params = CrowdParams::new(range);
+            let mut crowd = Crowd::default();
+            let solved = crowd.solve(&members, &params, 1.0 / 60.0, |_, _| true, |_, buf| buf.clear());
+            assert_eq!(solved[0], Some(Vec2::X), "range {range} should leave the wish alone");
+            assert_eq!(solved[1], Some(-Vec2::X), "range {range} should leave the wish alone");
+        }
+    }
+
+    /// A member whose position is unusable is reported unsolved and is not a neighbour to anyone.
+    #[test]
+    fn a_non_finite_position_is_reported_unsolved() {
+        let params = CrowdParams::new(4.0);
+        let mut crowd = Crowd::default();
+        let broken = member(1, Vec2::new(f32::NAN, 0.0), Vec2::ZERO, Some(Vec2::X));
+        let fine = member(2, Vec2::new(2.0, 0.0), Vec2::ZERO, Some(-Vec2::X));
+        let members = [broken, fine];
+        let solved = crowd.solve(&members, &params, 1.0 / 60.0, |_, _| true, |_, buf| buf.clear());
+        assert_eq!(solved[0], None);
+        assert_eq!(solved[1], Some(-Vec2::X), "the broken member must not be a neighbour");
+    }
+}

@@ -1,13 +1,23 @@
 [package]
 name = "bevy_orca"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
+rust-version = "1.97.1"
 description = "Reciprocal Velocity Obstacles (ORCA) local collision avoidance on bevy_math's Vec2 — the 2-D linear program, no ECS."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Ladvien/bevy_orca"
 keywords = ["bevy", "gamedev", "ai", "navigation", "collision-avoidance"]
 categories = ["game-development", "simulation"]
-publish = false
+# `docs/` holds a 1 MB GIF, so it is out of the package. The NOTICE ships with the source it covers.
+include = ["src/**", "Cargo.toml", "README.md", "LICENSE-*", "NOTICE"]
+
+[features]
+default = []
+# Opt-in derives on the value types. `bevy_math/serialize` is needed because `Agent` carries `Vec2`,
+# and glam's `Serialize`/`Deserialize` live behind it.
+serde = ["dep:serde", "bevy_math/serialize"]
+# Opt-in `Reflect` on the value types, for a host that stores them in a Bevy world.
+reflect = ["dep:bevy_reflect", "bevy_math/bevy_reflect"]
 
 # **`bevy_math`, not `bevy`, and the feature set is copied from `bevy_internal` on purpose.**
 #
@@ -23,6 +33,11 @@ publish = false
 # way — but a crate that is meant to stand alone should ask for the minimum it actually needs.)
 [dependencies]
 bevy_math = { version = "0.20.0", default-features = false, features = ["nostd-libm"] }
+# https://github.com/serde-rs/serde — the `serde` feature only; no derive machinery is compiled unless asked.
+serde = { version = "1", default-features = false, features = ["derive"], optional = true }
+# https://github.com/bevyengine/bevy — the `reflect` feature only, matching this repo's Bevy pin. It is
+# meant for Bevy apps, which already have std.
+bevy_reflect = { version = "0.20.0", default-features = false, optional = true }
 
 # **Examples only.** The crate itself takes `bevy_math` and nothing else — that is the point of it, and
 # `tests/leaf.rs` enforces it by reading `[dependencies]` only, deliberately. The `circle_swap` example

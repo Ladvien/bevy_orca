@@ -8,16 +8,21 @@ This repository, [`Ladvien/bevy_orca`](https://github.com/Ladvien/bevy_orca), is
 
 ## Build and test
 
-A leaf: `bevy_math` is the whole dependency list, so it builds and tests on its own.
+A leaf: `bevy_math` is the whole default dependency list, so it builds and tests on its own. The optional `serde` and `reflect` features add only derive impls on value types, and both are covered by CI.
+
+`tests/leaf.rs` is the ratchet that keeps it that way: it reads `[dependencies]` (deliberately not dev-dependencies) and scans `src/` for engine crate names. Widening either list is a design decision, so it costs a deliberate edit there.
 
 ```sh
 cargo test -p bevy_orca      # in the workspace
 cargo test                   # in a standalone checkout
+cargo test --all-features    # the optional derives, and the same tests
 ```
 
 ## The non-negotiable: no ECS, no plugin, no schedule
 
-`bevy_math` stays the whole dependency list. The caller decides when avoidance runs and what counts as a neighbour — those are gameplay decisions. The moment this crate takes `bevy_app`, or any type from a particular game, it stops being a library.
+`bevy_math` stays the whole dependency list (`serde` and `bevy_reflect` are optional, and only for derives on data that already exists). The caller decides when avoidance runs and what counts as a neighbour — those are gameplay decisions. The moment this crate takes `bevy_app`, or any type from a particular game, it stops being a library.
+
+**`Crowd` is a caller-owned batch helper; the caller still decides who is a neighbour (`sees`) and what is solid (`walls`).** It owns the spatial hash, the scratch buffers and the deterministic tie-break — the ring every host would otherwise write around `new_velocity_in` — and nothing else. It never looks at a game type, and it allocates nothing once warm because its buffers are `Vec`s it clears rather than drops.
 
 **Reciprocity is the algorithm, not a detail.** Each side takes *half* the avoidance; that is what stops two agents on a head-on course from freezing or oscillating the way summed-force separation does. A change that makes one agent yield fully has replaced ORCA with something else.
 
