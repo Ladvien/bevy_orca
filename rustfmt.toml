@@ -1,0 +1,5 @@
+# The style this repository was written in: wide lines and compact struct literals / call arguments.
+# Default rustfmt would explode every `Agent { pos, vel, radius, avoids }` in the examples across five
+# lines, which is churn in files a change did not touch.
+max_width = 110
+use_small_heuristics = "Max"

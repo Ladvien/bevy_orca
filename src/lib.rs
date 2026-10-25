@@ -14,8 +14,8 @@
 //!
 //! The half-plane construction and the three-stage linear program follow the authors' reference
 //! implementation, **RVO2** (van den Berg et al., Apache-2.0), closely enough that its names are kept
-//! — [`linear_program1`]/[`linear_program2`]/[`linear_program3`], `t_left`/`t_right`, and
-//! `RVO_EPSILON` as [`EPSILON`] — so the two can be read side by side. See `NOTICE`.
+//! — `linear_program1`/`linear_program2`/`linear_program3`, `t_left`/`t_right`, and `RVO_EPSILON` as
+//! `EPSILON` — so the two can be read side by side. See `NOTICE`.
 //!
 //! # Scope
 //!
@@ -24,6 +24,10 @@
 //! whatever the caller's collision resolver says it is. Walls therefore enter only as the optional
 //! `walls` half-planes described on [`new_velocity`] — the LP's *obstacle-line* count from static
 //! geometry is otherwise zero.
+
+pub mod crowd;
+
+pub use crowd::{Crowd, CrowdMember, CrowdParams};
 
 use bevy_math::Vec2;
 
@@ -36,7 +40,9 @@ const EPSILON: f32 = 1.0e-5;
 /// too (another commanded unit), the pair splits the avoidance 50/50 (reciprocity). When it does
 /// not (an idle unit holding ground), the moving agent takes the **full** avoidance so the idle
 /// unit isn't assumed to step aside and get walked through.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect))]
 pub struct Agent {
     pub pos: Vec2,
     pub vel: Vec2,
@@ -44,11 +50,28 @@ pub struct Agent {
     pub avoids: bool,
 }
 
+impl Default for Agent {
+    fn default() -> Self {
+        Self { pos: Vec2::ZERO, vel: Vec2::ZERO, radius: 0.0, avoids: false }
+    }
+}
+
 /// A half-plane constraint `{ v : det(direction, v - point) >= 0 }` on the new velocity.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 struct Line {
     point: Vec2,
     direction: Vec2,
+}
+
+/// Reusable buffers for [`new_velocity_in`], so a caller solving for a crowd allocates nothing after
+/// the first call.
+///
+/// Own one per solver (or per thread) and pass it in; it is cleared at the start of every call and
+/// never shrinks, so it grows to the widest call the caller ever makes and stays there.
+#[derive(Debug, Default)]
+pub struct OrcaScratch {
+    lines: Vec<Line>,
+    proj_lines: Vec<Line>,
 }
 
 /// 2-D cross product (signed area); `> 0` means `b` is left of `a`.
@@ -61,7 +84,10 @@ fn det(a: Vec2, b: Vec2) -> f32 {
 ///
 /// `time_horizon` is how many seconds ahead agent-agent collisions are anticipated (larger = more
 /// cautious, earlier avoidance); `dt` is the simulation step (used for the in-contact case); result
-/// magnitude is clamped to `max_speed`. Pure math — no panics, no allocation beyond the line list.
+/// magnitude is clamped to `max_speed`. Pure math — no panics.
+///
+/// Allocates a fresh line buffer per call. To solve repeatedly without allocating, own an
+/// [`OrcaScratch`] and call [`new_velocity_in`].
 pub fn new_velocity(
     agent: &Agent,
     pref_vel: Vec2,
@@ -71,10 +97,61 @@ pub fn new_velocity(
     dt: f32,
     max_speed: f32,
 ) -> Vec2 {
+    new_velocity_in(
+        &mut OrcaScratch::default(),
+        agent,
+        pref_vel,
+        neighbors,
+        walls,
+        time_horizon,
+        dt,
+        max_speed,
+    )
+}
+
+/// [`new_velocity`], reusing the buffers in `scratch`.
+///
+/// The result is always finite, because a paused frame or a zero time-scale would otherwise write a
+/// NaN into a caller's `Transform`. The guards, in order:
+///
+/// - `max_speed` not finite or `<= 0` → [`Vec2::ZERO`]: there is no velocity this agent may take.
+/// - `pref_vel` not finite → [`Vec2::ZERO`]: the preference itself is unusable.
+/// - `dt` or `time_horizon` not finite or `<= 0` → `pref_vel` clamped to `max_speed`: no time
+///   passes, so no constraint applies this step.
+// A solver's parameters are what the caller decides per step, and bundling them into a struct would
+// allocate a place to copy them into on every call — the opposite of this function's point. The eight
+// arguments mirror RVO2's `computeNewVelocity` and `new_velocity`'s own seven.
+#[allow(clippy::too_many_arguments)]
+pub fn new_velocity_in(
+    scratch: &mut OrcaScratch,
+    agent: &Agent,
+    pref_vel: Vec2,
+    neighbors: &[Agent],
+    walls: &[(Vec2, f32)],
+    time_horizon: f32,
+    dt: f32,
+    max_speed: f32,
+) -> Vec2 {
+    // A NaN velocity written into a caller's transform makes its agent vanish for good, so every
+    // degenerate input lands on a documented finite answer rather than a division by zero.
+    if !max_speed.is_finite() || max_speed <= 0.0 {
+        return Vec2::ZERO;
+    }
+    if !pref_vel.is_finite() {
+        return Vec2::ZERO;
+    }
+    if !dt.is_finite() || dt <= 0.0 || !time_horizon.is_finite() || time_horizon <= 0.0 {
+        // No time passes this step, so nothing can be constrained: take the wish.
+        return pref_vel.clamp_length_max(max_speed);
+    }
+
     let inv_time_horizon = 1.0 / time_horizon;
     let inv_dt = 1.0 / dt;
 
-    let mut lines: Vec<Line> = Vec::with_capacity(walls.len() + neighbors.len());
+    // Split the two buffers out of the scratch so the LP can hold `lines` while filling `proj_lines`.
+    let OrcaScratch { lines, proj_lines } = scratch;
+    lines.clear();
+    lines.reserve(walls.len() + neighbors.len());
 
     // Wall half-planes come first as *hard* obstacle constraints (index 0..num_obstacle). Each is
     // `(b, approach)`: `b` is a unit vector from the agent toward a solid cell and `approach` is the
@@ -83,10 +160,7 @@ pub fn new_velocity(
     // to contact, but never accelerate *through* the wall — so ORCA won't dodge a neighbor by
     // steering into a wall and stalling. Actual contact is still the caller's collision resolver.
     for &(b, approach) in walls {
-        lines.push(Line {
-            point: approach * b,
-            direction: Vec2::new(-b.y, b.x),
-        });
+        lines.push(Line { point: approach * b, direction: Vec2::new(-b.y, b.x) });
     }
     let num_obstacle = lines.len();
 
@@ -143,16 +217,13 @@ pub fn new_velocity(
         // Reciprocity: split the change with neighbors that also avoid; take it all against ones
         // that don't (idle units holding ground).
         let responsibility = if other.avoids { 0.5 } else { 1.0 };
-        lines.push(Line {
-            point: agent.vel + responsibility * u,
-            direction,
-        });
+        lines.push(Line { point: agent.vel + responsibility * u, direction });
     }
 
     let mut result = pref_vel;
-    let fail = linear_program2(&lines, max_speed, pref_vel, false, &mut result);
+    let fail = linear_program2(lines, max_speed, pref_vel, false, &mut result);
     if fail < lines.len() {
-        linear_program3(&lines, num_obstacle, fail, max_speed, &mut result);
+        linear_program3(lines, num_obstacle, fail, max_speed, proj_lines, &mut result);
     }
     result
 }
@@ -180,9 +251,9 @@ fn linear_program1(
     let mut t_left = -dot_product - sqrt_discriminant;
     let mut t_right = -dot_product + sqrt_discriminant;
 
-    for i in 0..line_no {
-        let denominator = det(line.direction, lines[i].direction);
-        let numerator = det(lines[i].direction, line.point - lines[i].point);
+    for other_line in lines.iter().take(line_no) {
+        let denominator = det(line.direction, other_line.direction);
+        let numerator = det(other_line.direction, line.point - other_line.point);
 
         if denominator.abs() <= EPSILON {
             // Lines are (almost) parallel.
@@ -259,7 +330,17 @@ fn linear_program2(
 /// over-constrained crowds, not a feature fallback. The first `num_obstacle` lines are hard wall
 /// constraints kept in every projection and never relaxed (an agent yields into a neighbor before it
 /// walks through a wall). `begin_line` is the first line that failed in `linear_program2`.
-fn linear_program3(lines: &[Line], num_obstacle: usize, begin_line: usize, radius: f32, result: &mut Vec2) {
+///
+/// `proj_lines` is the caller's reusable projection buffer: it is cleared at the start of every
+/// violating line and never shrinks, so a repeated solve allocates nothing.
+fn linear_program3(
+    lines: &[Line],
+    num_obstacle: usize,
+    begin_line: usize,
+    radius: f32,
+    proj_lines: &mut Vec<Line>,
+    result: &mut Vec2,
+) {
     let mut distance = 0.0_f32;
 
     for i in begin_line.max(num_obstacle)..lines.len() {
@@ -267,7 +348,8 @@ fn linear_program3(lines: &[Line], num_obstacle: usize, begin_line: usize, radiu
             // `result` violates line i by more than any seen so far; project the earlier lines onto
             // it and re-solve for the velocity that pushes constraint i's violation to a minimum. The
             // hard wall lines (0..num_obstacle) are always carried into the projection set.
-            let mut proj_lines: Vec<Line> = lines[0..num_obstacle].to_vec();
+            proj_lines.clear();
+            proj_lines.extend_from_slice(&lines[0..num_obstacle]);
             for j in num_obstacle..i {
                 let determinant = det(lines[i].direction, lines[j].direction);
                 let point = if determinant.abs() <= EPSILON {
@@ -287,7 +369,7 @@ fn linear_program3(lines: &[Line], num_obstacle: usize, begin_line: usize, radiu
 
             let temp = *result;
             let opt = Vec2::new(-lines[i].direction.y, lines[i].direction.x);
-            if linear_program2(&proj_lines, radius, opt, true, result) < proj_lines.len() {
+            if linear_program2(proj_lines.as_slice(), radius, opt, true, result) < proj_lines.len() {
                 // Should not happen except through floating-point error; keep the safer prior result.
                 *result = temp;
             }
@@ -376,5 +458,68 @@ mod tests {
         let b = agent(Vec2::new(1.0, 0.3), Vec2::new(-1.0, 0.0));
         let call = || new_velocity(&a, Vec2::new(1.0, 0.0), &[b], &[], 2.0, 1.0 / 60.0, 1.5);
         assert_eq!(call(), call());
+    }
+
+    /// Every degenerate `dt` a paused frame, a first frame or a zero time-scale can hand in must give
+    /// a finite velocity inside the speed disc, because a NaN in a caller's `Transform` is permanent.
+    #[test]
+    fn degenerate_dt_still_returns_a_finite_velocity() {
+        let a = agent(Vec2::new(-1.0, 0.0), Vec2::new(1.0, 0.0));
+        let b = agent(Vec2::new(1.0, 0.0), Vec2::new(-1.0, 0.0));
+        let pref = Vec2::new(1.0, 0.5);
+        let max_speed = 1.5;
+        for dt in [0.0_f32, -1.0, f32::NAN, f32::INFINITY] {
+            let v = new_velocity(&a, pref, &[b], &[], 2.0, dt, max_speed);
+            assert!(v.is_finite(), "dt {dt} gave a non-finite velocity {v}");
+            assert!(v.length() <= max_speed + 1.0e-4, "dt {dt}: speed {} > max {max_speed}", v.length());
+        }
+    }
+
+    /// The same for the time horizon: zero, negative and non-finite all mean "no anticipation".
+    #[test]
+    fn degenerate_time_horizon_still_returns_a_finite_velocity() {
+        let a = agent(Vec2::new(-1.0, 0.0), Vec2::new(1.0, 0.0));
+        let b = agent(Vec2::new(1.0, 0.0), Vec2::new(-1.0, 0.0));
+        let pref = Vec2::new(1.0, 0.5);
+        let max_speed = 1.5;
+        for h in [0.0_f32, -1.0, f32::NAN, f32::INFINITY] {
+            let v = new_velocity(&a, pref, &[b], &[], h, 1.0 / 60.0, max_speed);
+            assert!(v.is_finite(), "time_horizon {h} gave a non-finite velocity {v}");
+            assert!(v.length() <= max_speed + 1.0e-4, "h {h}: speed {} > max {max_speed}", v.length());
+        }
+    }
+
+    /// A bad `max_speed` means there is no velocity to take; a bad preference means none was asked for.
+    #[test]
+    fn degenerate_scalars_return_zero() {
+        let a = agent(Vec2::ZERO, Vec2::ZERO);
+        for max_speed in [0.0_f32, -1.0, f32::NAN, f32::INFINITY] {
+            let v = new_velocity(&a, Vec2::new(1.0, 0.0), &[], &[], 2.0, 1.0 / 60.0, max_speed);
+            assert_eq!(v, Vec2::ZERO, "max_speed {max_speed} should give the zero velocity");
+        }
+        for pref in [Vec2::new(f32::NAN, 0.0), Vec2::new(0.0, f32::INFINITY), Vec2::NAN] {
+            let v = new_velocity(&a, pref, &[], &[], 2.0, 1.0 / 60.0, 2.0);
+            assert_eq!(v, Vec2::ZERO, "pref {pref} should give the zero velocity");
+        }
+    }
+
+    /// `new_velocity_in` with a scratch must be the same arithmetic as `new_velocity`, bit for bit —
+    /// otherwise reusing a buffer would be a behaviour change rather than an allocation saving.
+    #[test]
+    fn scratch_matches_allocating_path_bit_for_bit() {
+        let max_speed = 2.0;
+        let mut scratch = OrcaScratch::default();
+        let walls = [(Vec2::new(1.0, 0.0), 0.4_f32)];
+        for i in 0..40u32 {
+            let hx = hash_f32(i.wrapping_mul(0x9E37_79B1)) * 4.0 - 2.0;
+            let hy = hash_f32(i.wrapping_mul(0x85EB_CA6B).wrapping_add(1)) * 4.0 - 2.0;
+            let a = agent(Vec2::ZERO, Vec2::new(1.0, 0.0));
+            let b = agent(Vec2::new(hx, hy), Vec2::new(-0.5, 0.2));
+            let pref = Vec2::new(1.5, 0.5);
+            let plain = new_velocity(&a, pref, &[b], &walls, 2.0, 1.0 / 60.0, max_speed);
+            let reused = new_velocity_in(&mut scratch, &a, pref, &[b], &walls, 2.0, 1.0 / 60.0, max_speed);
+            assert_eq!(plain.x.to_bits(), reused.x.to_bits(), "config {i}: x differs");
+            assert_eq!(plain.y.to_bits(), reused.y.to_bits(), "config {i}: y differs");
+        }
     }
 }

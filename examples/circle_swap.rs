@@ -130,8 +130,7 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
 /// quietly breaks the reciprocity the whole method rests on.
 fn step(mut walkers: Query<(&mut Walker, &mut Transform)>) {
     // Goals travel in the snapshot too, so the solve loop never has to index back into the query.
-    let snapshot: Vec<(Vec2, Vec2, Vec2)> =
-        walkers.iter().map(|(w, _)| (w.pos, w.vel, w.goal)).collect();
+    let snapshot: Vec<(Vec2, Vec2, Vec2)> = walkers.iter().map(|(w, _)| (w.pos, w.vel, w.goal)).collect();
 
     let mut solved: Vec<Vec2> = Vec::with_capacity(snapshot.len());
     for (i, (pos, vel, goal)) in snapshot.iter().enumerate() {
@@ -154,11 +153,8 @@ fn step(mut walkers: Query<(&mut Walker, &mut Transform)>) {
         // velocity for precisely this reason. Deterministic here rather than random, so the picture is
         // the same on every run.
         let nudge = Vec2::new((i as f32 * 12.9898).sin(), (i as f32 * 78.233).sin()) * 0.16;
-        let pref = if dist < 1.0e-4 {
-            Vec2::ZERO
-        } else {
-            to_goal / dist * MAX_SPEED.min(dist * 2.0) + nudge
-        };
+        let pref =
+            if dist < 1.0e-4 { Vec2::ZERO } else { to_goal / dist * MAX_SPEED.min(dist * 2.0) + nudge };
 
         solved.push(new_velocity(&me, pref, &neighbors, &[], TIME_HORIZON, DT, MAX_SPEED));
     }

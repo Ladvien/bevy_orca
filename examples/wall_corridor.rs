@@ -11,7 +11,7 @@
 //! Run: `cargo run -p bevy_orca --example wall_corridor`
 
 use bevy_math::Vec2;
-use bevy_orca::{new_velocity, Agent};
+use bevy_orca::{Agent, new_velocity};
 
 const DT: f32 = 1.0 / 30.0;
 const MAX_SPEED: f32 = 1.5;

@@ -14,8 +14,21 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  lint:
+    name: fmt + clippy + doc
+    runs-on: [self-hosted, big]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: "rustfmt, clippy" }
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo doc --no-deps --all-features
+        env: { RUSTDOCFLAGS: "-D warnings" }
+
   build:
     name: build (standalone) + test
+    needs: lint
     runs-on: [self-hosted, big]
     steps:
       - uses: actions/checkout@v4
@@ -35,8 +48,17 @@ jobs:
       - name: Build with only the declared features
         run: cargo build
 
+      # The optional features are the other half of the same hole: `serde` and `reflect` name types
+      # (`bevy_math/serialize`, `bevy_reflect`) that no default build ever touches, so without these
+      # two a broken feature would ship.
+      - name: Build with every feature
+        run: cargo build --all-features
+
       - name: Test
         run: cargo test
+
+      - name: Test with every feature
+        run: cargo test --all-features
 
       - name: Build examples
         run: cargo build --examples
