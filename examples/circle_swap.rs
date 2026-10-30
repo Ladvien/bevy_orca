@@ -149,9 +149,9 @@ fn step(mut walkers: Query<(&mut Walker, &mut Transform)>) {
         // **Break the symmetry, or they deadlock — and that is a property of the method, not a bug
         // in this demo.** With every agent identical, equally spaced, and aimed at the exact same
         // point, the linear program has no reason to prefer left over right; the constraints stay
-        // perfectly balanced and the ring simply stalls. RVO2's own circle demo perturbs the preferred
-        // velocity for precisely this reason. Deterministic here rather than random, so the picture is
-        // the same on every run.
+        // perfectly balanced and the ring simply stalls. RVO2's Blocks and Roadmap demos perturb the
+        // preferred velocity for precisely this reason (its Circle demo does not). Deterministic here
+        // rather than random, so the picture is the same on every run.
         let nudge = Vec2::new((i as f32 * 12.9898).sin(), (i as f32 * 78.233).sin()) * 0.16;
         let pref =
             if dist < 1.0e-4 { Vec2::ZERO } else { to_goal / dist * MAX_SPEED.min(dist * 2.0) + nudge };
