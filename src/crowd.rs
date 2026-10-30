@@ -185,7 +185,9 @@ impl Crowd {
     /// Reciprocity is assumed only of a neighbour this step moves. One with no `pref_vel`, a
     /// `pref_vel` that is not finite, or a [`max_speed`](CrowdMember::max_speed) that leaves it no
     /// velocity will not step aside, so each member near it takes the *full* avoidance against it;
-    /// every other neighbour takes half.
+    /// every other neighbour takes half. (A member whose `walls` are unusable holds still too, but
+    /// only its `walls` closure can say so and that runs after the neighbours are built, so it is still
+    /// offered as stepping aside.)
     ///
     /// `sees(i, j)` decides whether member `i` treats member `j` as a neighbour at all — the host's
     /// gameplay rule (same storey, same team, can see through a door). `walls(i, &mut buf)` fills
