@@ -2,7 +2,7 @@
 
 Every stem below is a home-still document (`distill_search` / `hs distill search` finds it; `markdown_read` reads it). A source the corpus lacks is listed under **Not in the corpus** with what was tried, so the next pass does not search for it again.
 
-Scanned last: iteration 3 (2026-10-30), twice. `catalog_recent` (200 rows, 21:00–21:06 UTC, nearly all LLM and graphics arXiv embeds) held one document in these domains, `10.48550_arxiv.2210.04624` (below), and one on sorting, `10.48550_arxiv.2206.01784`; a second scan (200 rows, 21:18–21:27 UTC, LLM-agent-memory arXiv embeds only) held none in these domains (`10.48550_arxiv.math_9410209`, Edelsbrunner & Mücke's "Simulation of simplicity", is the only geometry row and is about degenerate inputs to exact predicates, not this crate's float LP). Iterations 1 and 2 found none.
+Scanned last: iteration 4 (2026-10-30). `catalog_recent` (200 rows, 22:57–23:13 UTC) held nothing identifiable in these domains: every stem is an opaque hash, an arXiv or PubMed number, or an Anna's Archive file name (medical, LLM and graphics batches); no title could be matched to ORCA, velocity obstacles, crowds, pedestrian dynamics, low-dimensional LP, spatial hashing or parallel stepping. `distill_search` was unavailable (`gpu busy`) while scanning. Earlier: iteration 3 scanned twice. `catalog_recent` (200 rows, 21:00–21:06 UTC, nearly all LLM and graphics arXiv embeds) held one document in these domains, `10.48550_arxiv.2210.04624` (below), and one on sorting, `10.48550_arxiv.2206.01784`; a second scan (200 rows, 21:18–21:27 UTC, LLM-agent-memory arXiv embeds only) held none in these domains (`10.48550_arxiv.math_9410209`, Edelsbrunner & Mücke's "Simulation of simplicity", is the only geometry row and is about degenerate inputs to exact predicates, not this crate's float LP). Iterations 1 and 2 found none.
 
 ## Velocity obstacles, RVO and ORCA (model)
 
@@ -60,7 +60,7 @@ Scanned last: iteration 3 (2026-10-30), twice. `catalog_recent` (200 rows, 21:00
 
 ## Not in the corpus
 
-- **van den Berg, Guy, Lin & Manocha, "Reciprocal n-Body Collision Avoidance"**, ISRR 2009, Springer STAR 70 (2011), DOI `10.1007/978-3-642-19457-3_1` — the paper RVO2 implements. `paper_download` (iteration 1): no open-access copy from unpaywall, PMC, Semantic Scholar, Europe PMC, OpenAlex or CrossRef; CORE needs a key. The authors' copy is `https://gamma.cs.unc.edu/ORCA/publications/ORCA.pdf`.
+- **van den Berg, Guy, Lin & Manocha, "Reciprocal n-Body Collision Avoidance"**, ISRR 2009, Springer STAR 70 (2011), DOI `10.1007/978-3-642-19457-3_1` — the paper RVO2 implements. `paper_download` (iteration 1): no open-access copy from unpaywall, PMC, Semantic Scholar, Europe PMC, OpenAlex or CrossRef; CORE needs a key. The authors' copy is `https://gamma.cs.unc.edu/ORCA/publications/ORCA.pdf` and it downloads (1.6 MB); iteration 4 read and quoted it (§3, §4.2, §5.4: reciprocity, the half share, full responsibility for static obstacles) with the `read` tool, in `docs/research/members-that-do-not-move.md`. It is still not a home-still document.
 - Seidel, "Small-dimensional linear programming and convex hulls made easy", DCG 1991 — the randomized incremental LP RVO2's three stages descend from.
 - Seyfried et al., bottleneck flow and the fundamental diagram of pedestrian movement (2005–2009).
 - Singh et al., "SteerBench: a benchmark suite for evaluating steering behaviors", 2009.
