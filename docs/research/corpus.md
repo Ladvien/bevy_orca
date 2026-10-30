@@ -2,7 +2,7 @@
 
 Every stem below is a home-still document (`distill_search` / `hs distill search` finds it; `markdown_read` reads it). A source the corpus lacks is listed under **Not in the corpus** with what was tried, so the next pass does not search for it again.
 
-Scanned last: iteration 2 (2026-10-30). `catalog_recent` (200 rows, all social-science and medical embeds) held no new document in these domains; iteration 1's scan found none either.
+Scanned last: iteration 3 (2026-10-30). `catalog_recent` (200 rows, 21:00–21:06 UTC, nearly all LLM and graphics arXiv embeds) held one document in these domains, `10.48550_arxiv.2210.04624` (below), and one on sorting, `10.48550_arxiv.2206.01784`; iterations 1 and 2 found none.
 
 ## Velocity obstacles, RVO and ORCA (model)
 
@@ -24,6 +24,7 @@ Scanned last: iteration 2 (2026-10-30). `catalog_recent` (200 rows, all social-s
 
 - `10.17815_cd.2016.1` — Curtis, Best & Manocha, "Menge: A Modular Framework for Simulating Crowd Movement", Collective Dynamics 2016. Scenario specs (periodic hallway), spatial-query choice per scene.
 - `10.48550_arxiv.2309.12841` — Kwiatkowski et al., reward design for crowd simulation via RL (scenario set).
+- `10.48550_arxiv.2210.04624` — "WebCrowds: An Authoring Tool for Crowd Simulation", 2022. Found by the iteration 3 `catalog_recent` scan.
 
 ## Shipping games and engines
 
@@ -43,6 +44,12 @@ Scanned last: iteration 2 (2026-10-30). `catalog_recent` (200 rows, all social-s
 - `book_real_time_collision_detection_ericson` — Ericson, *Real-Time Collision Detection*. Uniform grids, hashed storage.
 - `10.1111_j.1467-8659.2005.00829.x` — Teschner et al., "Collision Detection for Deformable Objects", 2005. Spatial hashing.
 
+## Sorting and selection (technical)
+
+- `10.1145_3505286` — Axtmann, Witt, Ferizovic & Sanders, "Engineering In-place (Shared-memory) Sorting Algorithms", ACM TOPC 2022 (arXiv 2009.13569): in-place sorting as a speed advantage, not a penalty. Downloaded in iteration 3 (`papers/10/10.1145_3505286.pdf`); not yet converted or indexed.
+- `10.48550_arxiv.2206.01784` — Adinets & Merrill, "Onesweep: A Faster Least Significant Digit Radix Sort for GPUs", 2022: the radix-sort alternative to a comparison sort of cell keys. Found by the iteration 3 `catalog_recent` scan.
+- The Rust standard library's sorts and selection (`rust-lang/rust` tag `1.98.1`, `library/core/src/slice/mod.rs`, `library/core/src/slice/sort/`, `library/alloc/src/slice.rs`; GitHub, not home-still documents): which of `sort_by`, `sort_unstable_by` and `select_nth_unstable_by` allocate.
+
 ## Low-dimensional linear programming and robust geometry (technical)
 
 - `book_geometric_tools_computer_graphics_schneider` — Schneider & Eberly, *Geometric Tools for Computer Graphics*.
@@ -57,3 +64,4 @@ Scanned last: iteration 2 (2026-10-30). `catalog_recent` (200 rows, all social-s
 - Seidel, "Small-dimensional linear programming and convex hulls made easy", DCG 1991 — the randomized incremental LP RVO2's three stages descend from.
 - Seyfried et al., bottleneck flow and the fundamental diagram of pedestrian movement (2005–2009).
 - Singh et al., "SteerBench: a benchmark suite for evaluating steering behaviors", 2009.
+- Musser, "Introspective Sorting and Selection Algorithms", *Software: Practice and Experience* 27(8), 1997, DOI `10.1002/(sici)1097-024x(199708)27:8<983::aid-spe117>3.0.co;2-#` — introselect, the algorithm behind `select_nth_unstable`. `paper_search` (iteration 3) found only Wiley's paywalled PDF. Kiwiel, "On Floyd and Rivest's SELECT algorithm", TCS 2005 (`10.1016/j.tcs.2005.06.032`): ScienceDirect only, not tried.
