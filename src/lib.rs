@@ -205,8 +205,11 @@ pub fn new_velocity_in(
     let num_obstacle = lines.len();
 
     for other in neighbors {
-        // A neighbour with no usable state has no velocity obstacle: there is nothing to constrain.
-        if !usable_state(other.pos, other.vel, other.radius) {
+        // A neighbour with no usable state has no velocity obstacle: there is nothing to constrain. A
+        // negative radius is the one such state that still builds a finite line, so it is refused
+        // here; a position, velocity or radius that is not finite makes the line not finite, and the
+        // line is refused below.
+        if other.radius < 0.0 {
             continue;
         }
         let relative_position = other.pos - agent.pos;
