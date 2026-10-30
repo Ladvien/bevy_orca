@@ -342,6 +342,50 @@ mod tests {
         assert!((v - Vec2::X).length() > 1.0e-3, "expected avoidance, got {v}");
     }
 
+    /// A member this solve will not move — a wish it cannot use, or no speed to move at — is avoided
+    /// in full, exactly as an unsteered one is: `avoids` means "this member will step aside", and
+    /// neither of these will. A steered member still takes half, so the control below differs.
+    #[test]
+    fn a_member_that_will_not_move_is_avoided_in_full() {
+        let params = CrowdParams::new(4.0);
+        let mover = member(8, Vec2::new(-1.5, 0.0), Vec2::new(1.0, 0.0), Some(Vec2::X));
+        let unsteered = member(7, Vec2::ZERO, Vec2::ZERO, None);
+        let mut crowd = Crowd::default();
+        let mut solve_mover = |other: CrowdMember| {
+            crowd.solve(&[other, mover], &params, 1.0 / 60.0, |_, _| true, |_, buf| buf.clear())[1]
+                .expect("the mover is solved")
+        };
+        let want = solve_mover(unsteered);
+
+        let wish = |p: Vec2| CrowdMember { pref_vel: Some(p), ..unsteered };
+        let wish_and_speed = |max_speed: f32| CrowdMember { max_speed, ..wish(Vec2::X) };
+        for still in [
+            wish(Vec2::new(f32::NAN, 0.0)),
+            wish(Vec2::new(0.0, f32::INFINITY)),
+            wish_and_speed(0.0),
+            wish_and_speed(-1.0),
+            wish_and_speed(f32::NAN),
+            wish_and_speed(f32::INFINITY),
+            // So large that its square overflows: `new_velocity_in` answers `Vec2::ZERO` for it too.
+            wish_and_speed(1.0e20),
+        ] {
+            let got = solve_mover(still);
+            assert_eq!(
+                (got.x.to_bits(), got.y.to_bits()),
+                (want.x.to_bits(), want.y.to_bits()),
+                "{still:?} does not move but was assumed to take half: {got} vs {want}"
+            );
+        }
+
+        // Control: a member that will step aside takes its half, so the mover takes less.
+        let half = solve_mover(wish(Vec2::ZERO));
+        assert_ne!(
+            (half.x.to_bits(), half.y.to_bits()),
+            (want.x.to_bits(), want.y.to_bits()),
+            "a steered member must still be assumed to avoid"
+        );
+    }
+
     /// `sees` is the host's rule, and a `false` from it means the two genuinely ignore each other.
     #[test]
     fn a_hidden_member_is_ignored() {
