@@ -72,4 +72,4 @@ A game developer whose physics blows up one villager sees that villager stop for
 
 - Recast/Detour source (`DetourNavMeshQuery.cpp`, `DetourCrowd.cpp`): read on GitHub, not a home-still document.
 - ORCA, DOI `10.1007/978-3-642-19457-3_1`: still not downloadable (see `corpus.md`).
-- Goldberg, "What every computer scientist should know about floating-point arithmetic" (ACM CS 1991): not in the corpus, not searched this pass; Ericson ch. 11 and PBRT §3.9 cover what this note needs.
+- Goldberg, "What every computer scientist should know about floating-point arithmetic" (ACM CS 1991): not in the corpus, not searched this pass; Ericson ch. 11 and PBRT's NaN and infinity notes cover what this note needs.

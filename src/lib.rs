@@ -194,13 +194,19 @@ pub fn new_velocity_in(
     // The constraint `v · b <= approach` lets the agent slide along or move away freely and coast up
     // to contact, but never accelerate *through* the wall — so ORCA won't dodge a neighbor by
     // steering into a wall and stalling. Actual contact is still the caller's collision resolver.
+    //
+    // A hard constraint that is not a half-plane (a normal that is not a unit vector, an approach that
+    // is not finite) cannot be dropped like a neighbour, so the agent holds still. The test is
+    // accumulated over the walls rather than branched on per wall, which keeps this loop as cheap as
+    // it was before the test existed.
+    let mut walls_usable = true;
     for &(b, approach) in walls {
         let point = approach * b;
-        // A hard constraint that is not a half-plane cannot be dropped like a neighbour: hold still.
-        if !b.is_normalized() || !point.is_finite() {
-            return Vec2::ZERO;
-        }
+        walls_usable &= b.is_normalized() & point.is_finite();
         lines.push(Line { point, direction: Vec2::new(-b.y, b.x) });
+    }
+    if !walls_usable {
+        return Vec2::ZERO;
     }
     let num_obstacle = lines.len();
 
