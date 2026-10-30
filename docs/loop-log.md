@@ -132,6 +132,8 @@ All 32 non-rally single-thread rows: mean −9.5%, median −3.6%. Over +5% in t
 
 **Release.** None: `v0.2.1` was tagged 12:26 −0500 today, 5 h 05 min before this pass's gate; the fix stays under `## [Unreleased]` with iteration 2's.
 
+**Gate on the merged tree** (`274e425`, pushed): fmt, clippy `-D warnings`, rustdoc `-D warnings`, the three builds, `cargo test --all-features` (23 + 5 + 2 tests) and `cargo build --examples --all-features` green. The first `cargo test` failed in the linker, not in a test: `ld terminated with signal 9` while linking the `circle_swap` example in the dev profile, with 6 of 31 GB available on a host shared with a dozen CI runners; the re-run linked and passed (23 + 5 + 2). The first merged-tree gate also hit the 900 s tool deadline compiling that example under load; the gate takes 6–15 minutes on this host, so run it without a deadline.
+
 ### Ranked backlog
 
 1. **#8** — `Crowd::solve` offers a member it will not move (a non-finite wish, or `max_speed <= 0`) as `avoids: true`, so a mover takes half the avoidance against a rooted unit; use one predicate for "this solve will steer this member" shared with the skip and `new_velocity_in`'s `max_speed` guard, and reconcile `README.md:88` with the `None` the code returns. The issue carries a failing test.
