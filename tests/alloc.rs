@@ -168,3 +168,45 @@ fn a_warmed_crowd_allocates_nothing() {
     }
     assert_eq!(allocs(), 0, "20 warmed crowd solves allocated {} time(s)", allocs());
 }
+
+/// The same promise for a crowd that is going somewhere. Every tick here the whole group has moved two
+/// cells on, so a neighbour search that keeps storage per cell visited would allocate on every one of
+/// them and keep growing for as long as the crowd walks.
+#[test]
+fn a_warmed_crowd_that_walks_into_new_cells_allocates_nothing() {
+    use bevy_orca::{Crowd, CrowdMember, CrowdParams};
+
+    let params = CrowdParams::new(2.0);
+    let dt = 1.0 / 60.0;
+    let base: Vec<CrowdMember> = (0..60u32)
+        .map(|i| CrowdMember {
+            key: u64::from(i),
+            pos: Vec2::new((i % 10) as f32, (i / 10) as f32) * 0.9,
+            vel: Vec2::X,
+            radius: 0.28,
+            max_speed: 1.5,
+            pref_vel: Some(Vec2::X),
+        })
+        .collect();
+    let at_tick = |tick: u32, members: &mut Vec<CrowdMember>| {
+        members.clear();
+        let offset = Vec2::new(tick as f32 * 2.0 * params.neighbour_range, 0.0);
+        members.extend(base.iter().map(|m| CrowdMember { pos: m.pos + offset, ..*m }));
+    };
+
+    let mut crowd = Crowd::default();
+    let mut members = Vec::with_capacity(base.len());
+    // Warm on the first tick's ground only.
+    at_tick(0, &mut members);
+    let _ = crowd.solve(&members, &params, dt, |_, _| true, |_, buf| buf.clear());
+
+    let mut made = 0;
+    for tick in 1..=20 {
+        at_tick(tick, &mut members);
+        reset_counter();
+        let solved = crowd.solve(&members, &params, dt, |_, _| true, |_, buf| buf.clear());
+        made += allocs();
+        assert!(solved.iter().flatten().all(|v| v.is_finite()));
+    }
+    assert_eq!(made, 0, "20 warmed solves of a crowd crossing new cells allocated {made} time(s)");
+}

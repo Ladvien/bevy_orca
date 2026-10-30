@@ -382,4 +382,19 @@ mod tests {
         assert_eq!(solved[0], None);
         assert_eq!(solved[1], Some(-Vec2::X), "the broken member must not be a neighbour");
     }
+
+    /// A finite position far enough out saturates its cell index at `i32::MAX` or `i32::MIN`; the
+    /// cells beside it must still be looked up without overflowing, in a debug build as in release.
+    #[test]
+    fn a_member_at_the_edge_of_the_float_range_is_solved_without_panicking() {
+        let params = CrowdParams::new(3.0);
+        let mut crowd = Crowd::default();
+        let members = [
+            member(1, Vec2::new(1.0e30, -1.0e30), Vec2::ZERO, Some(Vec2::X)),
+            member(2, Vec2::new(f32::MAX, f32::MAX), Vec2::ZERO, Some(-Vec2::X)),
+            member(3, Vec2::new(-f32::MAX, 0.0), Vec2::ZERO, Some(Vec2::Y)),
+        ];
+        let solved = crowd.solve(&members, &params, 1.0 / 60.0, |_, _| true, |_, buf| buf.clear());
+        assert_eq!(solved, [Some(Vec2::X), Some(-Vec2::X), Some(Vec2::Y)], "nobody is near anybody");
+    }
 }
