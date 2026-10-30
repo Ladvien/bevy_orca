@@ -11,7 +11,7 @@
 
 use bevy_math::Vec2;
 
-use crate::{Agent, OrcaScratch, new_velocity_in};
+use crate::{Agent, OrcaScratch, new_velocity_in, usable_state};
 
 /// One member of a crowd, as the batch solver sees it.
 ///
@@ -76,7 +76,8 @@ impl CrowdParams {
 #[derive(Debug, Default)]
 pub struct Crowd {
     scratch: OrcaScratch,
-    /// The neighbour grid: `(cell key, member index)` for every member with a finite position, sorted,
+    /// The neighbour grid: `(cell key, member index)` for every member that can be a neighbour (finite
+    /// position and velocity, finite non-negative radius), sorted,
     /// `neighbour_range` per cell. Rebuilt every solve, so its size is the crowd's and not the ground
     /// the crowd has covered. Lookup only: every candidate list is sorted before use.
     cells: Vec<(u64, usize)>,
@@ -122,7 +123,11 @@ impl Crowd {
     /// Solve every steered member of `members` for one step of `dt`.
     ///
     /// The returned slice is indexed like `members`. `None` means that member was not solved: it has no
-    /// finite [`pref_vel`](CrowdMember::pref_vel), or its position is not finite.
+    /// finite [`pref_vel`](CrowdMember::pref_vel), or its position is not finite. Every other steered
+    /// member is solved by [`new_velocity_in`], so its answer to unusable input is that function's: a
+    /// member whose velocity or radius is unusable (not finite, or a negative radius) is solved to
+    /// [`Vec2::ZERO`] and holds still. A member whose position, velocity or radius is unusable is
+    /// nobody's neighbour, and takes none of the `max_neighbours` places.
     ///
     /// `sees(i, j)` decides whether member `i` treats member `j` as a neighbour at all — the host's
     /// gameplay rule (same storey, same team, can see through a door). `walls(i, &mut buf)` fills
@@ -139,12 +144,17 @@ impl Crowd {
         let range = params.neighbour_range;
         let search = range > 0.0 && range.is_finite();
 
-        // Rebuild the grid: one entry per member, sorted by cell. The pairs are unique, so the sorted
-        // order is fully determined, and the buffer is cleared rather than dropped, so a warm `Crowd`
-        // allocates nothing here however far its members have walked.
+        // Rebuild the grid: one entry per member that can be a neighbour, sorted by cell. The pairs are
+        // unique, so the sorted order is fully determined, and the buffer is cleared rather than
+        // dropped, so a warm `Crowd` allocates nothing here however far its members have walked. A
+        // member with no usable state has no velocity obstacle, so it is left out here rather than
+        // taking a neighbour's place only to be skipped by the solver.
         self.cells.clear();
         if search {
             for (i, m) in members.iter().enumerate() {
+                if !usable_state(m.pos, m.vel, m.radius) {
+                    continue;
+                }
                 if let Some((column, row)) = cell_of(m.pos, range) {
                     self.cells.push((cell_key(i64::from(column), i64::from(row)), i));
                 }
@@ -415,5 +425,109 @@ mod tests {
         ];
         let solved = crowd.solve(&members, &params, 1.0 / 60.0, |_, _| true, |_, buf| buf.clear());
         assert_eq!(solved, [Some(Vec2::X), Some(-Vec2::X), Some(Vec2::Y)], "nobody is near anybody");
+    }
+
+    /// A member whose velocity or radius is unusable holds still, and is nobody's neighbour: the rest
+    /// of the crowd is solved bit for bit as if it were not there, and it takes no neighbour's place.
+    #[test]
+    fn a_member_with_unusable_state_holds_still_and_is_nobodys_neighbour() {
+        let mut params = CrowdParams::new(4.0);
+        params.max_neighbours = 1;
+        let walker = member(1, Vec2::new(-1.0, 0.05), Vec2::new(1.0, 0.0), Some(Vec2::X));
+        let other = member(2, Vec2::new(1.5, -0.05), Vec2::new(-1.0, 0.0), Some(-Vec2::X));
+        let mut crowd = Crowd::default();
+        let alone =
+            crowd.solve(&[walker, other], &params, 1.0 / 60.0, |_, _| true, |_, buf| buf.clear()).to_vec();
+        // Between the two, so it would be each one's nearest neighbour if it counted.
+        let between = member(3, Vec2::new(0.25, 0.0), Vec2::ZERO, Some(Vec2::Y));
+        for broken in [
+            CrowdMember { vel: Vec2::new(f32::NAN, 0.0), ..between },
+            CrowdMember { vel: Vec2::new(0.0, f32::INFINITY), ..between },
+            CrowdMember { radius: -0.4, ..between },
+            CrowdMember { radius: f32::NAN, ..between },
+        ] {
+            let members = [walker, broken, other];
+            let solved = crowd.solve(&members, &params, 1.0 / 60.0, |_, _| true, |_, buf| buf.clear());
+            assert_eq!(solved[1], Some(Vec2::ZERO), "{broken:?} should hold still");
+            for (got, want) in [(solved[0], alone[0]), (solved[2], alone[1])] {
+                let (got, want) = (got.expect("solved"), want.expect("solved"));
+                assert_eq!(
+                    got.x.to_bits(),
+                    want.x.to_bits(),
+                    "{broken:?} moved a neighbour: {got} vs {want}"
+                );
+                assert_eq!(
+                    got.y.to_bits(),
+                    want.y.to_bits(),
+                    "{broken:?} moved a neighbour: {got} vs {want}"
+                );
+            }
+        }
+    }
+
+    /// Crowds of every size from empty to eight, with any member field, parameter, wall or `dt` made
+    /// hostile at random: every solved velocity is finite, and nothing panics.
+    #[test]
+    fn hostile_crowds_never_give_a_non_finite_velocity() {
+        use crate::tests::HOSTILE;
+        let mut state = 0u64;
+        let mut next = || {
+            state = state.wrapping_add(1);
+            (splitmix64(state) >> 40) as f32 / (1u64 << 24) as f32
+        };
+        let mut crowd = Crowd::default();
+        for step in 0..3_000u64 {
+            let share = if step % 4 == 0 { 0.0 } else { 0.25 };
+            let mut value = |lo: f32, hi: f32| {
+                let (sane, roll, pick) = (lo + (hi - lo) * next(), next(), next());
+                if roll < share {
+                    HOSTILE[((pick * HOSTILE.len() as f32) as usize).min(HOSTILE.len() - 1)]
+                } else {
+                    sane
+                }
+            };
+            let n = (step % 9) as usize;
+            let members: Vec<CrowdMember> = (0..n)
+                .map(|i| CrowdMember {
+                    key: i as u64,
+                    pos: Vec2::new(value(-2.0, 2.0), value(-2.0, 2.0)),
+                    vel: Vec2::new(value(-1.5, 1.5), value(-1.5, 1.5)),
+                    radius: value(0.2, 0.5),
+                    max_speed: value(0.5, 2.0),
+                    pref_vel: Some(Vec2::new(value(-1.5, 1.5), value(-1.5, 1.5))),
+                })
+                .collect();
+            let walls: Vec<(Vec2, f32)> = (0..n)
+                .map(|_| {
+                    let angle = value(0.0, std::f32::consts::TAU);
+                    (Vec2::new(angle.cos(), angle.sin()), value(-0.5, 3.0))
+                })
+                .collect();
+            let params = CrowdParams {
+                time_horizon: value(0.5, 3.0),
+                neighbour_range: value(1.0, 4.0),
+                max_neighbours: (step % 7) as usize,
+                nudge: value(0.0, 0.1),
+            };
+            let dt = value(1.0 / 60.0, 0.1);
+            let solved = crowd.solve(
+                &members,
+                &params,
+                dt,
+                |i, j| (i + j) % 5 != 3,
+                |i, buf| {
+                    if let Some(&wall) = walls.get(i)
+                        && i % 2 == 0
+                    {
+                        buf.push(wall);
+                    }
+                },
+            );
+            for (i, v) in solved.iter().enumerate() {
+                if let Some(v) = v {
+                    assert!(v.is_finite(), "step {step}: member {i} {:?} solved to {v}", members[i]);
+                }
+            }
+        }
     }
 }

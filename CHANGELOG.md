@@ -4,6 +4,15 @@ All notable changes to this crate are recorded here. The format follows [Keep a 
 
 ## [Unreleased]
 
+### Fixed
+
+- `new_velocity_in` (and so `new_velocity` and `Crowd::solve`) returned NaN or infinite velocities, despite "the result is always finite", for input its guards did not look at: an agent's own non-finite velocity or radius, a neighbour's non-finite or negative-radius state, a non-finite or non-unit wall, a `max_speed` above about `1.8e19`, a subnormal `dt` or `time_horizon`, and finite values whose arithmetic overflows `f32` (agents near `±f32::MAX`). A hostile sweep found 6 505 non-finite answers in 200 000 single solves and 1 709 in 20 000 crowd steps; it now finds none. Each case has one documented answer: an agent with unusable own state, or an unusable wall, holds still (`Vec2::ZERO`); an unusable neighbour, or one whose constraint overflows, is skipped; a `max_speed` whose square overflows gives `Vec2::ZERO`; a `dt` or `time_horizon` whose reciprocal overflows means no time passes. Finite, in-range input is bit-identical to before.
+
+### Changed
+
+- `Crowd::solve` leaves a member whose position, velocity or radius is unusable out of everyone's neighbour list, so it takes none of the `max_neighbours` places; such a member with a finite position is solved to `Vec2::ZERO` rather than to a NaN.
+- A wall normal must now be a unit vector to `Vec2::is_normalized`'s tolerance, as the docs always said; a zero or scaled normal used to be a weaker or absent constraint and now holds the agent still.
+
 ## [0.2.1] - 2026-10-30
 
 ### Added

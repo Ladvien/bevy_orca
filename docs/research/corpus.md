@@ -2,7 +2,7 @@
 
 Every stem below is a home-still document (`distill_search` / `hs distill search` finds it; `markdown_read` reads it). A source the corpus lacks is listed under **Not in the corpus** with what was tried, so the next pass does not search for it again.
 
-Scanned last: iteration 1 (2026-10-30). `catalog_recent` (200 rows) held no new document in these domains.
+Scanned last: iteration 2 (2026-10-30). `catalog_recent` (200 rows, all social-science and medical embeds) held no new document in these domains; iteration 1's scan found none either.
 
 ## Velocity obstacles, RVO and ORCA (model)
 
@@ -34,6 +34,7 @@ Scanned last: iteration 1 (2026-10-30). `catalog_recent` (200 rows) held no new 
 - `gameaipro4-ch09-obstacle-avoidance-robots-multiple-sizes-forms` — Horizon Zero Dawn's obstacle avoidance for robots of several sizes, Game AI Pro 4, ch. 9.
 - `gameaipro2-ch18-context-steering-behavior-driven-steering-macro` — context steering, Game AI Pro 2, ch. 18.
 - `s2008-advances-full-course-notes-4` — SIGGRAPH 2008 Advances course (AMD Froblins): GPU crowd local avoidance, deadlock at sinks.
+- Recast/Detour (`recastnavigation/recastnavigation` on GitHub, not a home-still document) — `DetourCrowd.cpp` (the crowd: proximity grid, neighbours sorted by distance) and `DetourNavMeshQuery.cpp` (every query refuses a non-finite position or a negative or non-finite radius with `DT_INVALID_PARAM`). Read on GitHub in iterations 1 and 2.
 
 ## Spatial hashing and neighbour search (technical)
 
@@ -47,6 +48,8 @@ Scanned last: iteration 1 (2026-10-30). `catalog_recent` (200 rows) held no new 
 - `book_geometric_tools_computer_graphics_schneider` — Schneider & Eberly, *Geometric Tools for Computer Graphics*.
 - `10.1007_pl00009321` — Shewchuk, "Adaptive Precision Floating-Point Arithmetic and Fast Robust Geometric Predicates", 1997.
 - `10.48550_arXiv.1312.3300` — "Numerical Reproducibility and Parallel Computations" (reproducibility across thread counts).
+- `PBR3_03_Shapes`, `PBR3_11_Volume_Scattering` — Pharr, Jakob & Humphreys, *Physically Based Rendering* 3rd ed.: IEEE NaN and infinity semantics in geometric tests (NaN comparisons are false; `0 · ∞` is NaN and propagates).
+- `book_real_time_collision_detection_ericson` ch. 11, "Numerical Robustness": INF/NaN in intersection tests must answer "no intersection".
 
 ## Not in the corpus
 

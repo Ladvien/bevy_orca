@@ -81,6 +81,15 @@ fn det(a: Vec2, b: Vec2) -> f32 {
     a.x * b.y - a.y * b.x
 }
 
+/// Whether an agent's state can enter a solve at all: a finite position and velocity, and a radius
+/// that is finite and not negative (`0` is a point). Recast/Detour refuses the same values with
+/// `DT_INVALID_PARAM`; here an agent that fails it holds still, and a neighbour that fails it is
+/// skipped. [`Crowd`] uses the same test to keep such a member out of everyone's neighbour list.
+#[inline]
+pub(crate) fn usable_state(pos: Vec2, vel: Vec2, radius: f32) -> bool {
+    pos.is_finite() && vel.is_finite() && radius.is_finite() && radius >= 0.0
+}
+
 /// Compute the collision-avoiding velocity for `agent` nearest to `pref_vel`, given `neighbors`.
 ///
 /// `time_horizon` is how many seconds ahead agent-agent collisions are anticipated (larger = more
@@ -112,13 +121,27 @@ pub fn new_velocity(
 
 /// [`new_velocity`], reusing the buffers in `scratch`.
 ///
-/// The result is always finite, because a paused frame or a zero time-scale would otherwise write a
-/// NaN into a caller's `Transform`. The guards, in order:
+/// The result is always finite, whatever the input, because a NaN written into a caller's
+/// `Transform` makes its agent vanish for good. Every input the solve cannot use gets one documented
+/// answer, in this order:
 ///
-/// - `max_speed` not finite or `<= 0` → [`Vec2::ZERO`]: there is no velocity this agent may take.
+/// - `max_speed` not finite, `<= 0`, or so large that its square overflows `f32` (above about
+///   `1.8e19`) → [`Vec2::ZERO`]: there is no velocity this agent may take.
 /// - `pref_vel` not finite → [`Vec2::ZERO`]: the preference itself is unusable.
-/// - `dt` or `time_horizon` not finite or `<= 0` → `pref_vel` clamped to `max_speed`: no time
-///   passes, so no constraint applies this step.
+/// - the agent's own `pos` or `vel` not finite, or its `radius` negative or not finite →
+///   [`Vec2::ZERO`]: it has no velocity obstacle to solve with, so it holds still. A caller that
+///   writes the result back has a usable velocity again next step.
+/// - `dt` or `time_horizon` not finite, `<= 0`, or so small that its reciprocal overflows →
+///   `pref_vel` clamped to `max_speed`: no time passes, so no constraint applies this step.
+/// - a wall whose normal is not a unit vector ([`Vec2::is_normalized`]) or whose `approach` is not
+///   finite → [`Vec2::ZERO`]: a wall is a hard constraint, and one that is not a half-plane cannot be
+///   dropped, so the agent holds still rather than risk walking through it.
+/// - a neighbour whose `pos` or `vel` is not finite, or whose `radius` is negative or not finite, is
+///   skipped: it has no velocity obstacle. So is one whose constraint overflows `f32` relative to this
+///   agent (agents near `±f32::MAX`), as if it were out of range.
+///
+/// A `radius` of `0` is a point, and usable. Finite, in-range input passes every one of these tests,
+/// so none of them changes a single bit of a sane solve.
 // A solver's parameters are what the caller decides per step, and bundling them into a struct would
 // allocate a place to copy them into on every call — the opposite of this function's point. The eight
 // arguments mirror RVO2's `computeNewVelocity` and `new_velocity`'s own seven.
@@ -135,19 +158,30 @@ pub fn new_velocity_in(
 ) -> Vec2 {
     // A NaN velocity written into a caller's transform makes its agent vanish for good, so every
     // degenerate input lands on a documented finite answer rather than a division by zero.
-    if !max_speed.is_finite() || max_speed <= 0.0 {
+    // The speed disc's radius is squared in every line test, so a `max_speed` whose square is not a
+    // number is as unusable as an infinite one.
+    if max_speed <= 0.0 || !(max_speed * max_speed).is_finite() {
         return Vec2::ZERO;
     }
     if !pref_vel.is_finite() {
         return Vec2::ZERO;
     }
-    if !dt.is_finite() || dt <= 0.0 || !time_horizon.is_finite() || time_horizon <= 0.0 {
-        // No time passes this step, so nothing can be constrained: take the wish.
-        return pref_vel.clamp_length_max(max_speed);
+    if !usable_state(agent.pos, agent.vel, agent.radius) {
+        return Vec2::ZERO;
     }
-
     let inv_time_horizon = 1.0 / time_horizon;
     let inv_dt = 1.0 / dt;
+    if !dt.is_finite()
+        || dt <= 0.0
+        || !time_horizon.is_finite()
+        || time_horizon <= 0.0
+        || !inv_dt.is_finite()
+        || !inv_time_horizon.is_finite()
+    {
+        // No time passes this step (a subnormal step is as good as none), so nothing can be
+        // constrained: take the wish.
+        return pref_vel.clamp_length_max(max_speed);
+    }
 
     // Split the two buffers out of the scratch so the LP can hold `lines` while filling `proj_lines`.
     let OrcaScratch { lines, proj_lines } = scratch;
@@ -161,11 +195,23 @@ pub fn new_velocity_in(
     // to contact, but never accelerate *through* the wall — so ORCA won't dodge a neighbor by
     // steering into a wall and stalling. Actual contact is still the caller's collision resolver.
     for &(b, approach) in walls {
-        lines.push(Line { point: approach * b, direction: Vec2::new(-b.y, b.x) });
+        let point = approach * b;
+        // A hard constraint that is not a half-plane cannot be dropped like a neighbour: hold still.
+        if !b.is_normalized() || !point.is_finite() {
+            return Vec2::ZERO;
+        }
+        lines.push(Line { point, direction: Vec2::new(-b.y, b.x) });
     }
     let num_obstacle = lines.len();
 
     for other in neighbors {
+        // A neighbour with no usable state has no velocity obstacle: there is nothing to constrain. A
+        // negative radius is the one such state that still builds a finite line, so it is refused
+        // here; a position, velocity or radius that is not finite makes the line not finite, and the
+        // line is refused below.
+        if other.radius < 0.0 {
+            continue;
+        }
         let relative_position = other.pos - agent.pos;
         let relative_velocity = agent.vel - other.vel;
         let dist_sq = relative_position.length_squared();
@@ -218,7 +264,13 @@ pub fn new_velocity_in(
         // Reciprocity: split the change with neighbors that also avoid; take it all against ones
         // that don't (idle units holding ground).
         let responsibility = if other.avoids { 0.5 } else { 1.0 };
-        lines.push(Line { point: agent.vel + responsibility * u, direction });
+        let point = agent.vel + responsibility * u;
+        // Finite input can still overflow `f32` (two agents near `±f32::MAX`, a radius near it): a
+        // constraint the arithmetic cannot represent is as far out of reach as one out of range.
+        if !point.is_finite() || !direction.is_finite() {
+            continue;
+        }
+        lines.push(Line { point, direction });
     }
 
     let mut result = pref_vel;
@@ -243,8 +295,10 @@ fn linear_program1(
     let dot_product = line.point.dot(line.direction);
     let discriminant = dot_product * dot_product + radius * radius - line.point.length_squared();
 
-    if discriminant < 0.0 {
-        // The max-speed disc doesn't intersect this line at all — infeasible.
+    if !discriminant.is_finite() || discriminant < 0.0 {
+        // The max-speed disc doesn't intersect this line at all — infeasible. A discriminant that
+        // overflowed or is NaN answers the same: an INF/NaN test means "no intersection", never
+        // "everywhere" (RVO2 tests only `< 0`; for every finite discriminant the branch is RVO2's).
         return false;
     }
 
@@ -469,7 +523,7 @@ mod tests {
         let b = agent(Vec2::new(1.0, 0.0), Vec2::new(-1.0, 0.0));
         let pref = Vec2::new(1.0, 0.5);
         let max_speed = 1.5;
-        for dt in [0.0_f32, -1.0, f32::NAN, f32::INFINITY] {
+        for dt in [0.0_f32, -1.0, f32::NAN, f32::INFINITY, 1.0e-40] {
             let v = new_velocity(&a, pref, &[b], &[], 2.0, dt, max_speed);
             assert!(v.is_finite(), "dt {dt} gave a non-finite velocity {v}");
             assert!(v.length() <= max_speed + 1.0e-4, "dt {dt}: speed {} > max {max_speed}", v.length());
@@ -483,7 +537,7 @@ mod tests {
         let b = agent(Vec2::new(1.0, 0.0), Vec2::new(-1.0, 0.0));
         let pref = Vec2::new(1.0, 0.5);
         let max_speed = 1.5;
-        for h in [0.0_f32, -1.0, f32::NAN, f32::INFINITY] {
+        for h in [0.0_f32, -1.0, f32::NAN, f32::INFINITY, 1.0e-40] {
             let v = new_velocity(&a, pref, &[b], &[], h, 1.0 / 60.0, max_speed);
             assert!(v.is_finite(), "time_horizon {h} gave a non-finite velocity {v}");
             assert!(v.length() <= max_speed + 1.0e-4, "h {h}: speed {} > max {max_speed}", v.length());
@@ -494,7 +548,7 @@ mod tests {
     #[test]
     fn degenerate_scalars_return_zero() {
         let a = agent(Vec2::ZERO, Vec2::ZERO);
-        for max_speed in [0.0_f32, -1.0, f32::NAN, f32::INFINITY] {
+        for max_speed in [0.0_f32, -1.0, f32::NAN, f32::INFINITY, 1.0e20, f32::MAX] {
             let v = new_velocity(&a, Vec2::new(1.0, 0.0), &[], &[], 2.0, 1.0 / 60.0, max_speed);
             assert_eq!(v, Vec2::ZERO, "max_speed {max_speed} should give the zero velocity");
         }
@@ -521,6 +575,200 @@ mod tests {
             let reused = new_velocity_in(&mut scratch, &a, pref, &[b], &walls, 2.0, 1.0 / 60.0, max_speed);
             assert_eq!(plain.x.to_bits(), reused.x.to_bits(), "config {i}: x differs");
             assert_eq!(plain.y.to_bits(), reused.y.to_bits(), "config {i}: y differs");
+        }
+    }
+
+    /// An agent whose own position, velocity or radius is not usable has no velocity obstacle to
+    /// solve with: it holds still (and a caller that writes `ZERO` back has a usable velocity again).
+    #[test]
+    fn an_agent_with_unusable_state_holds_still() {
+        let b = agent(Vec2::new(1.0, 0.0), Vec2::new(-1.0, 0.0));
+        let walls = [(Vec2::Y, 1.0_f32)];
+        let fine = agent(Vec2::new(-1.0, 0.0), Vec2::new(1.0, 0.0));
+        let broken = [
+            Agent { pos: Vec2::new(f32::NAN, 0.0), ..fine },
+            Agent { pos: Vec2::new(0.0, f32::INFINITY), ..fine },
+            Agent { vel: Vec2::new(f32::NAN, 0.0), ..fine },
+            Agent { vel: Vec2::new(f32::NEG_INFINITY, 0.0), ..fine },
+            Agent { radius: f32::NAN, ..fine },
+            Agent { radius: f32::INFINITY, ..fine },
+            Agent { radius: -0.1, ..fine },
+        ];
+        for a in broken {
+            for neighbours in [&[][..], &[b][..]] {
+                let v = new_velocity(&a, Vec2::X, neighbours, &walls, 2.0, 1.0 / 60.0, 1.5);
+                assert_eq!(v, Vec2::ZERO, "{a:?} with {} neighbours should hold still", neighbours.len());
+            }
+        }
+        // A radius of zero is a point agent, not a broken one.
+        let point = Agent { radius: 0.0, ..fine };
+        let v = new_velocity(&point, Vec2::X, &[], &walls, 2.0, 1.0 / 60.0, 1.5);
+        assert_eq!(v, Vec2::X, "a point agent with nothing near keeps its wish");
+    }
+
+    /// A neighbour with no usable state, or one so far away that its constraint overflows `f32`, is
+    /// skipped: the answer is bit-for-bit the answer without it, so one corrupted agent does not move
+    /// anyone else.
+    #[test]
+    fn an_unusable_neighbour_is_skipped() {
+        let a = agent(Vec2::new(-1.0, 0.05), Vec2::new(1.0, 0.0));
+        let b = agent(Vec2::new(1.0, -0.05), Vec2::new(-1.0, 0.0));
+        let walls = [(Vec2::Y, 1.0_f32)];
+        let pref = Vec2::new(1.0, 0.0);
+        let without = new_velocity(&a, pref, &[b], &walls, 2.0, 1.0 / 60.0, 1.5);
+        let broken = [
+            Agent { pos: Vec2::new(f32::NAN, 0.0), ..b },
+            Agent { pos: Vec2::new(0.0, f32::NEG_INFINITY), ..b },
+            Agent { vel: Vec2::new(f32::INFINITY, 0.0), ..b },
+            Agent { vel: Vec2::NAN, ..b },
+            Agent { radius: f32::NAN, ..b },
+            Agent { radius: f32::INFINITY, ..b },
+            Agent { radius: -0.5, ..b },
+            // Finite, but its constraint overflows: a radius near `f32::MAX`.
+            Agent { pos: Vec2::new(0.0, 0.5), radius: f32::MAX, ..b },
+        ];
+        for bad in broken {
+            let with = new_velocity(&a, pref, &[b, bad], &walls, 2.0, 1.0 / 60.0, 1.5);
+            assert_eq!(
+                with.x.to_bits(),
+                without.x.to_bits(),
+                "{bad:?} moved the answer: {with} vs {without}"
+            );
+            assert_eq!(
+                with.y.to_bits(),
+                without.y.to_bits(),
+                "{bad:?} moved the answer: {with} vs {without}"
+            );
+        }
+
+        // Two agents at opposite ends of the float range: their relative position overflows, so
+        // neither constrains the other.
+        let far = Agent { pos: Vec2::new(f32::MAX, 0.0), ..a };
+        let other_end = Agent { pos: Vec2::new(-f32::MAX, 0.0), ..b };
+        let v = new_velocity(&far, pref, &[other_end], &[], 2.0, 1.0 / 60.0, 1.5);
+        assert_eq!(v, pref, "a neighbour beyond f32's reach should not constrain anything");
+    }
+
+    /// A wall is a hard constraint, so one that is not a half-plane — a normal that is not a unit
+    /// vector, an approach that is not finite — cannot be dropped: the agent holds still.
+    #[test]
+    fn an_unusable_wall_holds_the_agent_still() {
+        let a = agent(Vec2::ZERO, Vec2::new(1.0, 0.0));
+        let unusable = [
+            (Vec2::new(f32::NAN, 0.0), 1.0_f32),
+            (Vec2::new(0.0, f32::INFINITY), 1.0),
+            (Vec2::ZERO, 1.0),
+            (Vec2::new(2.0, 0.0), 1.0),
+            (Vec2::new(0.707, 0.707), 1.0),
+            (Vec2::X, f32::NAN),
+            (Vec2::X, f32::INFINITY),
+            (Vec2::X, f32::NEG_INFINITY),
+        ];
+        for wall in unusable {
+            let v = new_velocity(&a, Vec2::X, &[], &[(Vec2::Y, 2.0), wall], 2.0, 1.0 / 60.0, 1.5);
+            assert_eq!(v, Vec2::ZERO, "wall {wall:?} should hold the agent still");
+        }
+        // A normal that is a unit vector to f32 rounding is a wall, and it is enforced.
+        let diagonal = Vec2::new(1.0, 1.0).normalize();
+        let v = new_velocity(&a, Vec2::X, &[], &[(diagonal, 0.1)], 2.0, 1.0 / 60.0, 1.5);
+        assert!(v.dot(diagonal) <= 0.1 + 1.0e-5, "a valid wall must still bind: {v}");
+        assert_ne!(v, Vec2::ZERO);
+    }
+
+    /// Values a hostile or broken host can hand in, for every `f32` input: the non-finite ones, the
+    /// signed zeros, a subnormal, values whose square or reciprocal overflows, and negatives.
+    pub(crate) const HOSTILE: [f32; 17] = [
+        f32::NAN,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        0.0,
+        -0.0,
+        1.0e-40,
+        f32::MIN_POSITIVE,
+        1.0e-30,
+        1.0e10,
+        1.0e20,
+        -1.0e20,
+        1.0e30,
+        f32::MAX,
+        -f32::MAX,
+        -1.0,
+        -0.5,
+        3.0e38,
+    ];
+
+    /// The property the whole crate promises a host: whatever it hands in — every field of the agent,
+    /// its neighbours and walls, and every scalar — the answer is a finite velocity and never a panic.
+    /// Each case makes one field hostile, or (every seventeenth case) any field with a 30% chance.
+    #[test]
+    fn hostile_input_never_gives_a_non_finite_velocity() {
+        let mut scratch = OrcaScratch::default();
+        let mut seed = 0u32;
+        let mut next = || {
+            seed = seed.wrapping_add(1);
+            hash_f32(seed.wrapping_mul(0x9E37_79B1))
+        };
+        for case in 0..20_000u32 {
+            let which = case % 17;
+            let chaos = which == 16;
+            let take = |field: u32, sane: f32, roll: f32, pick: f32| -> f32 {
+                if which == field || (chaos && roll < 0.3) {
+                    HOSTILE[((pick * HOSTILE.len() as f32) as usize).min(HOSTILE.len() - 1)]
+                } else {
+                    sane
+                }
+            };
+            let mut field = |f: u32, lo: f32, hi: f32| {
+                let (sane, roll, pick) = (lo + (hi - lo) * next(), next(), next());
+                take(f, sane, roll, pick)
+            };
+            let me = Agent {
+                pos: Vec2::new(field(0, -5.0, 5.0), field(1, -5.0, 5.0)),
+                vel: Vec2::new(field(2, -2.0, 2.0), field(3, -2.0, 2.0)),
+                radius: field(4, 0.2, 0.6),
+                avoids: true,
+            };
+            let mut neighbours = [Agent::default(); 4];
+            for (k, n) in neighbours.iter_mut().enumerate() {
+                let base = if me.pos.is_finite() { me.pos } else { Vec2::ZERO };
+                *n = Agent {
+                    pos: base + Vec2::new(field(5, -2.0, 2.0), field(6, -2.0, 2.0)),
+                    vel: Vec2::new(field(7, -2.0, 2.0), field(7, -2.0, 2.0)),
+                    radius: field(8, 0.2, 0.6),
+                    avoids: k % 2 == 0,
+                };
+                // Coincident agents: the exact degenerate the overlapping branch divides by.
+                if which == 9 && k < 2 {
+                    n.pos = me.pos;
+                }
+            }
+            let angle = field(17, 0.0, std::f32::consts::TAU);
+            let normal = Vec2::new(angle.cos(), angle.sin());
+            let walls = [(
+                Vec2::new(field(10, normal.x, normal.x), field(10, normal.y, normal.y)),
+                field(11, -1.0, 4.0),
+            )];
+            let pref = Vec2::new(field(12, -2.0, 2.0), field(12, -2.0, 2.0));
+            let horizon = field(13, 0.5, 3.0);
+            let dt = field(14, 1.0 / 60.0, 0.1);
+            let max_speed = field(15, 0.5, 2.0);
+            let count = (case % 5) as usize;
+            let v = new_velocity_in(
+                &mut scratch,
+                &me,
+                pref,
+                &neighbours[..count],
+                &walls[..(case % 2) as usize],
+                horizon,
+                dt,
+                max_speed,
+            );
+            assert!(
+                v.is_finite(),
+                "case {case}: {v} from {me:?}, pref {pref}, neighbours {:?}, walls {:?}, horizon {horizon}, dt {dt}, max_speed {max_speed}",
+                &neighbours[..count],
+                &walls[..(case % 2) as usize],
+            );
         }
     }
 }
