@@ -90,6 +90,16 @@ pub(crate) fn usable_state(pos: Vec2, vel: Vec2, radius: f32) -> bool {
     pos.is_finite() && vel.is_finite() && radius.is_finite() && radius >= 0.0
 }
 
+/// Whether `max_speed` leaves an agent a velocity it may take at all: positive, and not so large
+/// that its square, which every line test uses as the speed disc's `radius²`, overflows `f32`. A NaN
+/// is not positive. [`new_velocity_in`] answers [`Vec2::ZERO`] when this is false, and [`Crowd`]
+/// offers such a member to its neighbours as one that will not step aside; they are one test so the
+/// two cannot disagree.
+#[inline]
+pub(crate) fn usable_speed(max_speed: f32) -> bool {
+    max_speed > 0.0 && (max_speed * max_speed).is_finite()
+}
+
 /// Compute the collision-avoiding velocity for `agent` nearest to `pref_vel`, given `neighbors`.
 ///
 /// `time_horizon` is how many seconds ahead agent-agent collisions are anticipated (larger = more
@@ -160,7 +170,7 @@ pub fn new_velocity_in(
     // degenerate input lands on a documented finite answer rather than a division by zero.
     // The speed disc's radius is squared in every line test, so a `max_speed` whose square is not a
     // number is as unusable as an infinite one.
-    if max_speed <= 0.0 || !(max_speed * max_speed).is_finite() {
+    if !usable_speed(max_speed) {
         return Vec2::ZERO;
     }
     if !pref_vel.is_finite() {

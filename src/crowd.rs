@@ -11,7 +11,7 @@
 
 use bevy_math::Vec2;
 
-use crate::{Agent, OrcaScratch, new_velocity_in, usable_state};
+use crate::{Agent, OrcaScratch, new_velocity_in, usable_speed, usable_state};
 
 /// One member of a crowd, as the batch solver sees it.
 ///
@@ -30,12 +30,16 @@ pub struct CrowdMember {
     pub vel: Vec2,
     /// Body radius.
     pub radius: f32,
-    /// Speed ceiling for the solved velocity.
+    /// Speed ceiling for the solved velocity. A ceiling that is not finite, not positive, or so
+    /// large that its square overflows `f32` leaves the member no velocity to take: it is solved to
+    /// [`Vec2::ZERO`], and its neighbours take the full avoidance against it.
     pub max_speed: f32,
     /// Where this member wants to go.
     ///
     /// `None` means another system moves this member this step: it is a neighbour to everyone else and
-    /// is never solved for. Its velocity is still read, so the agent that is moving it is avoided.
+    /// is never solved for. Its velocity is still read, so the agent that is moving it is avoided, and
+    /// in full: a member this step does not move is not assumed to step aside. A wish that is not
+    /// finite is the same as `None`.
     pub pref_vel: Option<Vec2>,
 }
 
@@ -150,6 +154,24 @@ fn splitmix64(mut x: u64) -> u64 {
     z ^ (z >> 31)
 }
 
+/// The wish [`Crowd::solve`] steers `m` by, or `None` when it leaves `m` unsolved: no
+/// [`pref_vel`](CrowdMember::pref_vel), one that is not finite, or a position that is not finite.
+#[inline]
+fn wish(m: &CrowdMember) -> Option<Vec2> {
+    m.pref_vel.filter(|pref| pref.is_finite() && m.pos.is_finite())
+}
+
+/// Whether [`Crowd::solve`] picks a velocity for `m` itself: it has a [`wish`] and a speed to move at.
+/// This is what a neighbour's [`Agent::avoids`] has to mean. Reciprocity gives each side half of the
+/// avoidance only because the other side takes the other half, so a member this step will not move
+/// — no wish, a wish that is not finite, or a `max_speed` that leaves it no velocity, which
+/// `new_velocity_in` answers with [`Vec2::ZERO`] — is avoided in full. The solve's skip and the
+/// flag both come from here, so they cannot disagree.
+#[inline]
+fn steers(m: &CrowdMember) -> bool {
+    usable_speed(m.max_speed) && wish(m).is_some()
+}
+
 impl Crowd {
     /// Solve every steered member of `members` for one step of `dt`.
     ///
@@ -159,6 +181,11 @@ impl Crowd {
     /// member whose velocity or radius is unusable (not finite, or a negative radius) is solved to
     /// [`Vec2::ZERO`] and holds still. A member whose position, velocity or radius is unusable is
     /// nobody's neighbour, and takes none of the `max_neighbours` places.
+    ///
+    /// Reciprocity is assumed only of a neighbour this step moves. One with no `pref_vel`, a
+    /// `pref_vel` that is not finite, or a [`max_speed`](CrowdMember::max_speed) that leaves it no
+    /// velocity will not step aside, so each member near it takes the *full* avoidance against it;
+    /// every other neighbour takes half.
     ///
     /// `sees(i, j)` decides whether member `i` treats member `j` as a neighbour at all — the host's
     /// gameplay rule (same storey, same team, can see through a door). `walls(i, &mut buf)` fills
@@ -198,12 +225,9 @@ impl Crowd {
 
         for i in 0..members.len() {
             let m = members[i];
-            let (Some(pref), true) = (m.pref_vel, m.pos.is_finite()) else {
+            let Some(pref) = wish(&m) else {
                 continue;
             };
-            if !pref.is_finite() {
-                continue;
-            }
 
             // Neighbours: every member within `range` that this one sees, nearest first, at most
             // `max_neighbours` of them. Ordering by `(distance, key)` is what makes the result a
@@ -250,9 +274,9 @@ impl Crowd {
                     pos: other.pos,
                     vel: other.vel,
                     radius: other.radius,
-                    // A member nobody steers is not assumed to step aside, so this one takes the full
-                    // avoidance against it instead of walking through it.
-                    avoids: other.pref_vel.is_some(),
+                    // A member this step will not move is not assumed to step aside, so this one
+                    // takes the full avoidance against it instead of walking through it.
+                    avoids: steers(&other),
                 });
             }
 
@@ -340,6 +364,50 @@ mod tests {
         let v = solved[1].expect("the steered member is solved");
         assert!(v.is_finite());
         assert!((v - Vec2::X).length() > 1.0e-3, "expected avoidance, got {v}");
+    }
+
+    /// A member this solve will not move — a wish it cannot use, or no speed to move at — is avoided
+    /// in full, exactly as an unsteered one is: `avoids` means "this member will step aside", and
+    /// neither of these will. A steered member still takes half, so the control below differs.
+    #[test]
+    fn a_member_that_will_not_move_is_avoided_in_full() {
+        let params = CrowdParams::new(4.0);
+        let mover = member(8, Vec2::new(-1.5, 0.0), Vec2::new(1.0, 0.0), Some(Vec2::X));
+        let unsteered = member(7, Vec2::ZERO, Vec2::ZERO, None);
+        let mut crowd = Crowd::default();
+        let mut solve_mover = |other: CrowdMember| {
+            crowd.solve(&[other, mover], &params, 1.0 / 60.0, |_, _| true, |_, buf| buf.clear())[1]
+                .expect("the mover is solved")
+        };
+        let want = solve_mover(unsteered);
+
+        let wish = |p: Vec2| CrowdMember { pref_vel: Some(p), ..unsteered };
+        let wish_and_speed = |max_speed: f32| CrowdMember { max_speed, ..wish(Vec2::X) };
+        for still in [
+            wish(Vec2::new(f32::NAN, 0.0)),
+            wish(Vec2::new(0.0, f32::INFINITY)),
+            wish_and_speed(0.0),
+            wish_and_speed(-1.0),
+            wish_and_speed(f32::NAN),
+            wish_and_speed(f32::INFINITY),
+            // So large that its square overflows: `new_velocity_in` answers `Vec2::ZERO` for it too.
+            wish_and_speed(1.0e20),
+        ] {
+            let got = solve_mover(still);
+            assert_eq!(
+                (got.x.to_bits(), got.y.to_bits()),
+                (want.x.to_bits(), want.y.to_bits()),
+                "{still:?} does not move but was assumed to take half: {got} vs {want}"
+            );
+        }
+
+        // Control: a member that will step aside takes its half, so the mover takes less.
+        let half = solve_mover(wish(Vec2::ZERO));
+        assert_ne!(
+            (half.x.to_bits(), half.y.to_bits()),
+            (want.x.to_bits(), want.y.to_bits()),
+            "a steered member must still be assumed to avoid"
+        );
     }
 
     /// `sees` is the host's rule, and a `false` from it means the two genuinely ignore each other.
