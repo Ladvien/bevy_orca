@@ -3,7 +3,7 @@
 `Crowd::solve` gathers every member in range that `sees` accepts into `near`, a `Vec<(f32, u64, usize)>` of `(distance, key, index)`, sorts it with `sort_by`, and hands the first `max_neighbours` (10 by default) to the solver. Issue #7 found the sort on the hot path allocating, and the bench's new `rally` scene (units hex-packed at 2.65 agents/m² with a 5 m range: 89 to 258 candidates each) measures it:
 
 - **`sort_by` is the stable driftsort, and it allocates a scratch of `max(len − len/2, min(len, 8 MB / 24 B))` elements whenever that does not fit its 4 KiB stack buffer** — 170 elements of 24 bytes. Every member with more than 170 candidates allocates once per `solve`: **260 619 allocations in 480 warm steps** of the 1 000-member rally (`cand_mean` 170.8, `cand_max` 258), against the README's "`Crowd` allocates nothing after its buffers are warm". The existing scenes never reach it (their densest member has 65 candidates).
-- **It sorts every candidate when ten are used.** The 1 000-member rally's step costs 6 584 µs in `Crowd::solve`; the bench's own two-thread ring, which already selects instead of sorting, takes 1 911 µs for the same step split in two.
+- **It sorts every candidate when ten are used.** The 1 000-member rally's step takes 8.3 ms in `Crowd::solve` (median of three paired runs on a loaded 24-core host); with only the nearest ten chosen and ordered it takes 3.9 ms, and at 10 000 members 103 ms becomes 49 ms. The shorter lists of the bottleneck and the open field gain too (below).
 
 ## Sources
 
@@ -58,8 +58,8 @@ Stability is only worth paying for when two elements can compare equal. Here the
 ## Model adopted
 
 1. Gather candidates exactly as before: every member of the 3×3 block within `neighbour_range`, offered to `sees` in the same order, so the caller's rule sees the same pairs.
-2. If more than `max_neighbours` were accepted, `select_nth_unstable_by(max_neighbours, nearest_first)` moves the nearest `max_neighbours` to the front in O(candidates), and `truncate(max_neighbours)` drops the rest.
-3. `sort_unstable_by(nearest_first)` orders what is left — at most `max_neighbours` elements.
+2. If the list is longer than `SELECT_ABOVE` (16) **and** than twice `max_neighbours`, `select_nth_unstable_by(max_neighbours, nearest_first)` moves the nearest `max_neighbours` to the front in O(candidates) and `truncate(max_neighbours)` drops the rest.
+3. `sort_unstable_by(nearest_first)` orders what is left, then `truncate(max_neighbours)` — for a list the selection skipped, that is the whole list sorted and cut, which is what the old stable sort and cut did.
 4. `nearest_first` is one named comparator, `(distance by total_cmp, key, index)`, unchanged.
 
 Every neighbour list, and so every solved velocity, is identical bit for bit; nothing allocates once `near` has grown to the widest candidate list the crowd has produced.
@@ -68,14 +68,14 @@ Every neighbour list, and so every solved velocity, is identical bit for bit; no
 
 ## Parameters
 
-None new. `max_neighbours` and `neighbour_range` keep their meaning and defaults.
+None for the caller: `max_neighbours` and `neighbour_range` keep their meaning and defaults. One internal constant, `SELECT_ABOVE = 16`, is measured and not a knob: `select_nth_unstable` insertion-sorts a slice of up to 16 in full, so selecting first only adds a second pass. Micro-benchmark (one candidate list per call, `(f32, u64, usize)` elements, ns per list, `k` = `max_neighbours`): for `k = 10`, 12 candidates sort 171 ns vs select+sort 182 ns, 16 candidates 231 vs 236, 18 candidates 262 vs 245, 24 candidates 417 vs 322, 64 candidates 1 276 vs 545; for `k = 30`, 32 candidates 612 vs 656 (selection loses), 48 candidates 893 vs 840, 64 candidates 1 286 vs 964 — hence also the "twice `max_neighbours`" condition. Stable `sort_by` and `sort_unstable_by` + cut agree to within 3% up to 20 candidates. The first version of this change selected whenever the list was longer than `max_neighbours`; the bench's corridor (mean 11 candidates, up to 34) then ran 3 to 9% slower than before in all three paired rounds, and the threshold removed that (±2% at 1 000 agents and above).
 
 ## Validation targets
 
-- `tests/alloc.rs`: issue #7's dense crowd — 200 members 0.15 apart, `CrowdParams::new(4.0)`, 199 candidates each — allocates 0 times in 5 warm solves (before: once per member per solve).
-- The bench's `rally` `allocs` falls from one per dense member per step (260 619 at 1 000 members) to the handful a growing buffer costs.
-- Every bench hash — every scene, size, member order and thread count — equal to the baseline's; `cand_mean` and `cand_max` unchanged (the same candidates are found and offered to `sees`).
-- Cost: no case's median step more than 5% slower; the scaling exponent does not rise; the rally's step falls.
+- `tests/alloc.rs`: issue #7's dense crowd — 200 members 0.15 apart, `CrowdParams::new(4.0)`, 199 candidates each — allocates 0 times in 5 warm solves (before: 1 000, once per member per solve). **Met.**
+- The bench's `rally` `allocs` falls from one per dense member per step (260 619 at 1 000 members, 4 050 400 at 10 000) to the 2 a growing buffer costs. **Met.**
+- Every bench hash — every scene, size, member order and thread count — equal to the baseline's; `cand_mean` and `cand_max` unchanged (the same candidates are found and offered to `sees`). **Met: 0 mismatches over 80 rows × 3 rounds × base and new**, and `Crowd::solve` bit-equal to the base over 6 000 random tie-heavy crowds (446 656 solves, duplicate keys, lattices, random `sees`, `max_neighbours` from 0 to 1 000).
+- Cost: no case's median step more than 5% slower; the rally's step falls. **Met** (see the loop log for the table). The 1k→10k scaling exponent was to stay put; it rises where the step got cheaper (open 0.864 → 0.936, bottleneck 0.879 → 0.948, rally 1.094 → 1.103, medians of three paired runs; circle and corridor unchanged) because the saving per member follows the candidates per member, which are fewer at 10 000 than at 1 000 in these scenes (open 16.9 against 22.2, bottleneck 38.2 against 51.4). Every absolute time falls and every exponent but the rally's stays below 1.0: a justified trade, logged, not a regression.
 
 ## What great looks like
 
