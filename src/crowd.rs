@@ -72,7 +72,7 @@ impl CrowdParams {
 /// Own one per crowd and call [`solve`](Self::solve) every tick. Nothing in it is per-member state, so
 /// it is safe to solve several crowds with one `Crowd`, one after the other. Its buffers grow to the
 /// largest crowd it has solved and never shrink, so once warm it allocates nothing, wherever the crowd
-/// walks.
+/// walks and however tightly it packs.
 #[derive(Debug, Default)]
 pub struct Crowd {
     scratch: OrcaScratch,
@@ -81,7 +81,8 @@ pub struct Crowd {
     /// `neighbour_range` per cell. Rebuilt every solve, so its size is the crowd's and not the ground
     /// the crowd has covered. Lookup only: every candidate list is sorted before use.
     cells: Vec<(u64, usize)>,
-    /// Reused candidate buffer: `(distance, key, index)`, sorted nearest-first.
+    /// Reused candidate buffer: `(distance, key, index)`, cut to the nearest `max_neighbours` and sorted
+    /// nearest-first before use.
     near: Vec<(f32, u64, usize)>,
     /// Reused neighbour slice handed to the solver.
     neighbours: Vec<Agent>,
@@ -107,6 +108,32 @@ fn cell_of(pos: Vec2, range: f32) -> Option<(i32, i32)> {
 fn cell_key(column: i64, row: i64) -> u64 {
     let offset = |v: i64| (v - i64::from(i32::MIN)) as u64;
     (offset(row) << 32) | offset(column)
+}
+
+/// The order candidates are kept in: distance, then the caller's key, then the member's index. Each
+/// index appears once in a candidate list, so no two candidates compare equal: the order is strict and
+/// total, and an unstable selection or sort gives the one result a stable sort would.
+fn nearest_first(a: &(f32, u64, usize), b: &(f32, u64, usize)) -> core::cmp::Ordering {
+    a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2))
+}
+
+/// Candidate lists this short or shorter are sorted whole and cut, never selected from:
+/// `select_nth_unstable` insertion-sorts a slice of up to 16 in full anyway, so selecting first only
+/// adds a second pass (measured: about 10% dearer than one sort for 11 to 14 candidates).
+const SELECT_ABOVE: usize = 16;
+
+/// Cut `near` to its nearest `keep` candidates, in [`nearest_first`] order. A list longer than
+/// [`SELECT_ABOVE`] and than twice `keep` is first narrowed to its nearest `keep` by an in-place
+/// selection, O(candidates), so only those are sorted; selecting from a list barely longer than `keep`
+/// discards too little to pay for itself. Neither step allocates, and as no two candidates compare
+/// equal the result is the one a stable sort and a cut would give.
+fn nearest(near: &mut Vec<(f32, u64, usize)>, keep: usize) {
+    if near.len() > SELECT_ABOVE.max(keep.saturating_mul(2)) {
+        near.select_nth_unstable_by(keep, nearest_first);
+        near.truncate(keep);
+    }
+    near.sort_unstable_by(nearest_first);
+    near.truncate(keep);
 }
 
 /// The SplitMix64 output mix. A stable hash of the caller's key, so the side a head-on member steps to
@@ -175,7 +202,7 @@ impl Crowd {
             }
 
             // Neighbours: every member within `range` that this one sees, nearest first, at most
-            // `max_neighbours` of them. Sorting by `(distance, key)` is what makes the result a
+            // `max_neighbours` of them. Ordering by `(distance, key)` is what makes the result a
             // property of the world rather than of the input slice's order.
             self.near.clear();
             if search && let Some((cx, cy)) = cell_of(m.pos, range) {
@@ -207,11 +234,13 @@ impl Crowd {
                     }
                 }
             }
-            self.near.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
-            let keep = params.max_neighbours.min(self.near.len());
+            // Only the nearest `max_neighbours` are used, so only they are ordered; a packed crowd
+            // offers hundreds of candidates, and a stable sort would take a heap scratch for each
+            // member above 170 of them.
+            nearest(&mut self.near, params.max_neighbours);
 
             self.neighbours.clear();
-            for &(_, _, j) in &self.near[..keep] {
+            for &(_, _, j) in &self.near {
                 let other = members[j];
                 self.neighbours.push(Agent {
                     pos: other.pos,
@@ -225,7 +254,7 @@ impl Crowd {
 
             // The wish, nudged sideways when anyone is near. The side is the member's own, hashed from
             // its key, so two agents meeting head-on do not both pick the same side.
-            let wish = if keep == 0 {
+            let wish = if self.near.is_empty() {
                 pref
             } else {
                 let side = if splitmix64(m.key) & 1 == 0 { 1.0 } else { -1.0 };
@@ -380,6 +409,72 @@ mod tests {
                 }
                 (None, None) => {}
                 _ => panic!("key {}: solved for in one order and not the other", member.key),
+            }
+        }
+    }
+
+    /// With far more members in range than `max_neighbours`, each member is solved against exactly its
+    /// nearest `max_neighbours`, an equal distance going to the smaller key — including where the cut
+    /// falls inside a ring of equidistant members, and for no neighbours, one, and more than are in
+    /// range. The reference is a brute-force scan of every member, stably sorted.
+    #[test]
+    fn a_dense_crowd_is_solved_against_its_nearest_neighbours() {
+        // A 15 × 15 lattice 0.5 apart: every member has rings of neighbours at bit-equal distances.
+        // Keys are scrambled so key order is neither slice order nor lattice order, and velocities
+        // differ so that which neighbours are kept changes the answer.
+        let members: Vec<CrowdMember> = (0..225u64)
+            .map(|i| CrowdMember {
+                radius: 0.2,
+                ..member(
+                    splitmix64(i),
+                    Vec2::new((i % 15) as f32, (i / 15) as f32) * 0.5,
+                    Vec2::from_angle(i as f32 * 0.7) * 0.8,
+                    Some(Vec2::new(1.0, 0.3)),
+                )
+            })
+            .collect();
+        let dt = 1.0 / 60.0;
+        let mut crowd = Crowd::default();
+        let mut scratch = OrcaScratch::default();
+        let mut neighbours = Vec::new();
+        for max_neighbours in [0, 1, 6, 10, 30, 1_000] {
+            // No nudge, so the wish is the preference and the reference needs nothing but the scan.
+            let params = CrowdParams { max_neighbours, nudge: 0.0, ..CrowdParams::new(3.0) };
+            let solved = crowd.solve(&members, &params, dt, |_, _| true, |_, buf| buf.clear()).to_vec();
+            for (i, m) in members.iter().enumerate() {
+                let mut near: Vec<(f32, u64, usize)> = members
+                    .iter()
+                    .enumerate()
+                    .filter(|&(j, o)| j != i && o.pos.distance(m.pos) <= params.neighbour_range)
+                    .map(|(j, o)| (o.pos.distance(m.pos), o.key, j))
+                    .collect();
+                near.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+                neighbours.clear();
+                neighbours.extend(near.iter().take(max_neighbours).map(|&(_, _, j)| Agent {
+                    pos: members[j].pos,
+                    vel: members[j].vel,
+                    radius: members[j].radius,
+                    avoids: true,
+                }));
+                let me = Agent { pos: m.pos, vel: m.vel, radius: m.radius, avoids: true };
+                let pref = m.pref_vel.unwrap_or_default();
+                let want = new_velocity_in(
+                    &mut scratch,
+                    &me,
+                    pref,
+                    &neighbours,
+                    &[],
+                    params.time_horizon,
+                    dt,
+                    m.max_speed,
+                );
+                let got = solved[i].map(|v| (v.x.to_bits(), v.y.to_bits()));
+                assert_eq!(
+                    got,
+                    Some((want.x.to_bits(), want.y.to_bits())),
+                    "member {i} with max_neighbours {max_neighbours}: {:?} vs {want}",
+                    solved[i]
+                );
             }
         }
     }
