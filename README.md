@@ -46,6 +46,8 @@ let v = new_velocity(
 
 Finite, in-range input passes every one of these checks, so none of them changes a single bit of a normal solve.
 
+**The result is never faster than `max_speed`**, to `f32` rounding, for any finite input — in a dense knot, with neighbours standing on the agent, or with an own velocity a physics glitch made enormous. The speed disc is a constraint of the linear program rather than a clamp after it, and every half-plane is stored at its point nearest the origin so that two nearly parallel constraints cannot drag the arithmetic far from the disc. RVO2, which this crate follows, does not keep that bound: on the same dense random crowds its answer reaches 48 times `maxSpeed`.
+
 ## A whole crowd
 
 Solving one agent at a time leaves every host to write the same ring around it: a spatial hash to find neighbours without an O(n²) scan, a reused scratch buffer, a deterministic tie-break, the wall buffer. [`Crowd`] is that ring, once.
@@ -125,7 +127,7 @@ cargo run -p bevy_orca --example circle_swap    # the gif above. Needs a GPU.
 
 `circle_swap` is the picture. Two things in it are worth knowing before you tune this in your own game, because both were found by watching it fail:
 
-- **Perfect symmetry deadlocks.** Identical agents, evenly spaced, all aimed at one point give the linear program no reason to prefer left over right, and the ring simply stalls. RVO2's own circle demo perturbs the preferred velocity for this reason, and `Crowd`'s `nudge` does it deterministically from each member's key.
+- **Perfect symmetry deadlocks.** Identical agents, evenly spaced, all aimed at one point give the linear program no reason to prefer left over right, and the ring simply stalls. RVO2's `Blocks` and `Roadmap` demos perturb the preferred velocity for this reason ("Perturb a little to avoid deadlocks due to perfect symmetry"; its `Circle` demo does not), and `Crowd`'s `nudge` does it deterministically from each member's key. A nudge only acts while a member's wish is free to move, though: a ring whose neighbours constrain each other from the first step — twenty agents a metre apart at a 2-second horizon — stalls with or without one, and so does RVO2's.
 - **Too much lookahead stalls it too, and less obviously.** At a 3-second horizon the pack braked for a congestion that had not happened yet and thereby caused it: velocity decayed geometrically — 0.80, 0.57, 0.41, 0.29, 0.21 — while the crossing ground to a halt a ring-radius in. At 1.5 they commit, and the shear resolves it. If your crowd is mysteriously slow, this dial is the first suspect.
 
 ## Used by
