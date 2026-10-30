@@ -16,7 +16,11 @@
 //! The half-plane construction and the three-stage linear program follow the authors' reference
 //! implementation, **RVO2** (van den Berg et al., Apache-2.0), closely enough that its names are kept
 //! — `linear_program1`/`linear_program2`/`linear_program3`, `t_left`/`t_right`, and `RVO_EPSILON` as
-//! `EPSILON` — so the two can be read side by side. See `NOTICE`.
+//! `EPSILON` — so the two can be read side by side. See `NOTICE`. One numerical change: every line is
+//! stored at its point nearest the origin, and `linear_program3` builds its projected lines from the
+//! two lines' distances to the origin rather than through their intersection. The half-planes are
+//! RVO2's; the answer stays inside the speed disc to `f32` rounding, which RVO2's does not (it can
+//! leave it by many times `max_speed` when two constraints are nearly parallel).
 //!
 //! # Scope
 //!
@@ -58,10 +62,36 @@ impl Default for Agent {
 }
 
 /// A half-plane constraint `{ v : det(direction, v - point) >= 0 }` on the new velocity.
+///
+/// `direction` is a unit vector and `point` is the line's point nearest the origin. Every stage of the
+/// linear program relies on both: a line stored through a far point (two nearly parallel lines meet
+/// far away) makes `linear_program1`'s disc test subtract two huge, nearly equal squares, and its
+/// answer `point + t · direction` the sum of two huge, nearly opposite vectors — both catastrophic
+/// cancellation, which is how RVO2's answer leaves the speed disc. Stored at its foot, every number
+/// the test and the answer use is no larger than the disc for any line that can cut it.
+///
+/// The one exception is a neighbour's line whose direction came out as zero (its relative velocity
+/// sits exactly on the cutoff circle's centre): `det(ZERO, ·)` is zero, so no velocity ever violates
+/// it, and its point is the origin.
 #[derive(Debug, Clone, Copy)]
 struct Line {
     point: Vec2,
     direction: Vec2,
+}
+
+impl Line {
+    /// The line through `point` along the unit `direction`, stored at its point nearest the origin:
+    /// `det(direction, point)` is its signed distance from the origin, the one number that fixes it.
+    #[inline]
+    fn anchored(point: Vec2, direction: Vec2) -> Line {
+        Line { point: det(direction, point) * direction.perp(), direction }
+    }
+
+    /// The line's signed distance from the origin, `det(direction, point)`.
+    #[inline]
+    fn offset(&self) -> f32 {
+        det(self.direction, self.point)
+    }
 }
 
 /// Reusable buffers for [`new_velocity_in`], so a caller solving for a crowd allocates nothing after
@@ -93,8 +123,11 @@ pub(crate) fn usable_state(pos: Vec2, vel: Vec2, radius: f32) -> bool {
 /// Compute the collision-avoiding velocity for `agent` nearest to `pref_vel`, given `neighbors`.
 ///
 /// `time_horizon` is how many seconds ahead agent-agent collisions are anticipated (larger = more
-/// cautious, earlier avoidance); `dt` is the simulation step (used for the in-contact case); result
-/// magnitude is clamped to `max_speed`. Pure math — no panics.
+/// cautious, earlier avoidance); `dt` is the simulation step (used for the in-contact case). The
+/// result is never faster than `max_speed`, to `f32` rounding (a relative `1e-6`), for any finite
+/// input — however dense the neighbours, however nearly parallel their constraints, however fast the
+/// agent's own velocity: the speed disc is a constraint of the linear program, not a clamp after it.
+/// Pure math — no panics.
 ///
 /// Allocates a fresh line buffer per call. To solve repeatedly without allocating, own an
 /// [`OrcaScratch`] and call [`new_velocity_in`].
@@ -195,9 +228,16 @@ pub fn new_velocity_in(
     // to contact, but never accelerate *through* the wall — so ORCA won't dodge a neighbor by
     // steering into a wall and stalling. Actual contact is still the caller's collision resolver.
     for &(b, approach) in walls {
-        let point = approach * b;
         // A hard constraint that is not a half-plane cannot be dropped like a neighbour: hold still.
-        if !b.is_normalized() || !point.is_finite() {
+        if !b.is_normalized() {
+            return Vec2::ZERO;
+        }
+        // `is_normalized` allows `|b|` within about 1e-4 of 1; dividing it out makes the half-plane
+        // exactly `v · b <= approach` and its direction unit, as every stage of the LP assumes. The
+        // line is then at its foot already: `approach · b` is its point nearest the origin.
+        let b = b / b.length();
+        let point = approach * b;
+        if !point.is_finite() {
             return Vec2::ZERO;
         }
         lines.push(Line { point, direction: Vec2::new(-b.y, b.x) });
@@ -265,12 +305,15 @@ pub fn new_velocity_in(
         // that don't (idle units holding ground).
         let responsibility = if other.avoids { 0.5 } else { 1.0 };
         let point = agent.vel + responsibility * u;
-        // Finite input can still overflow `f32` (two agents near `±f32::MAX`, a radius near it): a
-        // constraint the arithmetic cannot represent is as far out of reach as one out of range.
-        if !point.is_finite() || !direction.is_finite() {
+        // Stored at its point nearest the origin, so a constraint built from a fast own velocity does
+        // not carry that speed into the disc test. Finite input can still overflow `f32` (two agents
+        // near `±f32::MAX`, a radius near it): a constraint the arithmetic cannot represent is as far
+        // out of reach as one out of range.
+        let line = Line::anchored(point, direction);
+        if !line.point.is_finite() || !direction.is_finite() {
             continue;
         }
-        lines.push(Line { point, direction });
+        lines.push(line);
     }
 
     let mut result = pref_vel;
@@ -407,19 +450,22 @@ fn linear_program3(
             proj_lines.extend_from_slice(&lines[0..num_obstacle]);
             for j in num_obstacle..i {
                 let determinant = det(lines[i].direction, lines[j].direction);
-                let point = if determinant.abs() <= EPSILON {
-                    if lines[i].direction.dot(lines[j].direction) > 0.0 {
-                        // Same direction — no new constraint.
-                        continue;
-                    }
-                    0.5 * (lines[i].point + lines[j].point)
-                } else {
-                    lines[i].point
-                        + (det(lines[j].direction, lines[i].point - lines[j].point) / determinant)
-                            * lines[i].direction
-                };
-                let direction = (lines[j].direction - lines[i].direction).normalize_or_zero();
-                proj_lines.push(Line { point, direction });
+                if determinant.abs() <= EPSILON && lines[i].direction.dot(lines[j].direction) > 0.0 {
+                    // Lines i and j are parallel and point the same way — no new constraint.
+                    continue;
+                }
+                // The projected line is where lines i and j are violated equally, along RVO2's
+                // direction `d_j - d_i`: `det(d_j - d_i, v) = offset_j - offset_i`. RVO2 anchors it at
+                // the two lines' intersection (at the midpoint of their points when they are
+                // anti-parallel), which for nearly parallel lines lies up to `1 / EPSILON` away and
+                // turns `linear_program1` into catastrophic cancellation. Built from the two offsets
+                // instead, it is the same line on the same side, anchored at its point nearest the
+                // origin. `d_j - d_i` is never zero here: equal directions are skipped above.
+                let between = lines[j].direction - lines[i].direction;
+                let length = between.length();
+                let direction = between / length;
+                let offset = (lines[j].offset() - lines[i].offset()) / length;
+                proj_lines.push(Line { point: offset * direction.perp(), direction });
             }
 
             let temp = *result;
@@ -490,20 +536,62 @@ mod tests {
         assert!((v - pref).length() > 1.0e-3, "expected avoidance, but velocity stayed at pref {pref}");
     }
 
+    /// The speed disc is the one constraint every stage of the linear program is built inside, so the
+    /// answer is never faster than `max_speed`, to `f32` rounding: in a dense knot of up to twelve
+    /// neighbours, with two neighbours standing on the agent, with a row of neighbours whose
+    /// constraints are nearly parallel (`linear_program3` projects lines that meet far away), and with
+    /// an own velocity far beyond `max_speed`. Before the lines were stored at their point nearest the
+    /// origin (0.2.1), 82 of these 4 000 answers left the disc: by up to 1.3% on ordinary input and by
+    /// a factor of 10⁷ from a fast own velocity (a 2.45-million-solve crowd sweep found 9.3×).
     #[test]
-    fn speed_bound_holds_across_many_configurations() {
-        // Property: for any neighbour placement the result never exceeds max_speed (the disc is a hard
-        // constraint carried through every projection). Deterministic sweep — no RNG crate.
-        let max_speed = 2.0;
-        for i in 0..40u32 {
-            // Deterministic pseudo-positions from a cheap hash, no entropy source.
-            let hx = hash_f32(i.wrapping_mul(0x9E37_79B1)) * 4.0 - 2.0;
-            let hy = hash_f32(i.wrapping_mul(0x85EB_CA6B).wrapping_add(1)) * 4.0 - 2.0;
-            let a = agent(Vec2::ZERO, Vec2::new(1.0, 0.0));
-            let b = agent(Vec2::new(hx, hy), Vec2::new(-0.5, 0.2));
-            let v = new_velocity(&a, Vec2::new(1.5, 0.5), &[b], &[], 2.0, 1.0 / 60.0, max_speed);
-            assert!(v.is_finite(), "non-finite velocity for config {i}: {v}");
-            assert!(v.length() <= max_speed + 1.0e-4, "config {i}: speed {} > max {max_speed}", v.length());
+    fn speed_bound_holds_in_dense_and_degenerate_constraint_sets() {
+        use std::f32::consts::TAU;
+        let mut scratch = OrcaScratch::default();
+        let mut seed = 0u32;
+        let mut next = || {
+            seed = seed.wrapping_add(1);
+            hash_f32(seed.wrapping_mul(0x9E37_79B1))
+        };
+        let mut neighbours = Vec::new();
+        let mut walls = Vec::new();
+        for case in 0..4_000u32 {
+            let family = case % 4;
+            let max_speed = 0.5 + 1.5 * next();
+            let own_speed = if family == 3 { 10.0_f32.powf(1.0 + 14.0 * next()) } else { 1.2 * max_speed * next() };
+            let me = Agent {
+                pos: Vec2::new(10.0 * next() - 5.0, 10.0 * next() - 5.0),
+                vel: Vec2::from_angle(TAU * next()) * own_speed,
+                radius: 0.2 + 0.4 * next(),
+                avoids: true,
+            };
+            neighbours.clear();
+            for k in 0..(13.0 * next()) as usize {
+                let offset = match family {
+                    1 if k < 2 => Vec2::ZERO,
+                    2 => Vec2::new(6.0 * next() - 3.0, 0.69 + 0.02 * next()),
+                    _ => Vec2::from_angle(TAU * next()) * 3.0 * next(),
+                };
+                neighbours.push(Agent {
+                    pos: me.pos + offset,
+                    vel: Vec2::from_angle(TAU * next()) * 2.0 * next(),
+                    radius: 0.2 + 0.4 * next(),
+                    avoids: next() < 0.7,
+                });
+            }
+            walls.clear();
+            for _ in 0..(3.0 * next()) as usize {
+                walls.push((Vec2::from_angle(TAU * next()), 5.0 * next() - 1.0));
+            }
+            let pref = Vec2::from_angle(TAU * next()) * 3.0 * next();
+            let horizon = 0.5 + 2.5 * next();
+            let dt = 1.0 / 60.0 + 0.08 * next();
+            let v = new_velocity_in(&mut scratch, &me, pref, &neighbours, &walls, horizon, dt, max_speed);
+            let speed = f64::from(v.x).hypot(f64::from(v.y));
+            assert!(
+                speed <= f64::from(max_speed) * (1.0 + 1.0e-6),
+                "case {case} (family {family}): speed {speed} is {}× max_speed {max_speed}",
+                speed / f64::from(max_speed),
+            );
         }
     }
 
