@@ -159,7 +159,7 @@ fn a_warmed_crowd_allocates_nothing() {
         let solved = crowd.solve(&members, &params, dt, |_, _| true, |_, buf| buf.clear());
         assert!(solved.iter().flatten().all(|v| v.is_finite()));
     };
-    // Warm: the hash map, the candidate list and the output slice all reach their working size here.
+    // Warm: the neighbour grid, the candidate list and the output slice all reach their working size.
     tick(&mut crowd);
 
     reset_counter();
@@ -209,4 +209,35 @@ fn a_warmed_crowd_that_walks_into_new_cells_allocates_nothing() {
         assert!(solved.iter().flatten().all(|v| v.is_finite()));
     }
     assert_eq!(made, 0, "20 warmed solves of a crowd crossing new cells allocated {made} time(s)");
+}
+
+/// The same promise for a packed crowd (issue #7): 200 members 0.15 apart with a 4-unit range, so every
+/// member has 199 candidates to choose its 10 neighbours from. The standard library's stable sort
+/// takes a heap scratch above 170 such candidates, so a candidate list ordered with it allocated once
+/// per member per tick — 1 000 times in these five ticks — exactly where units bunch up.
+#[test]
+fn a_warmed_dense_crowd_allocates_nothing() {
+    use bevy_orca::{Crowd, CrowdMember, CrowdParams};
+
+    let params = CrowdParams::new(4.0);
+    let dt = 1.0 / 60.0;
+    let members: Vec<CrowdMember> = (0..200u32)
+        .map(|i| CrowdMember {
+            key: u64::from(i),
+            pos: Vec2::new((i % 20) as f32, (i / 20) as f32) * 0.15,
+            vel: Vec2::ZERO,
+            radius: 0.07,
+            max_speed: 1.5,
+            pref_vel: Some(Vec2::X),
+        })
+        .collect();
+    let mut crowd = Crowd::default();
+    let _ = crowd.solve(&members, &params, dt, |_, _| true, |_, buf| buf.clear());
+
+    reset_counter();
+    for _ in 0..5 {
+        let solved = crowd.solve(&members, &params, dt, |_, _| true, |_, buf| buf.clear());
+        assert!(solved.iter().flatten().all(|v| v.is_finite()));
+    }
+    assert_eq!(allocs(), 0, "5 warmed solves of a dense crowd allocated {} time(s)", allocs());
 }
