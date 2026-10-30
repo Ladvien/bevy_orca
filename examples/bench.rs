@@ -203,7 +203,8 @@ impl World {
                 extent = spacing * side as f32;
                 for (i, &k) in keys.iter().enumerate() {
                     let (cx, cy) = ((i % side) as f32, (i / side) as f32);
-                    let jitter = Vec2::new(unit(k, 1) - 0.5, unit(k, 2) - 0.5) * (spacing - 2.0 * RADIUS) * 0.8;
+                    let jitter =
+                        Vec2::new(unit(k, 1) - 0.5, unit(k, 2) - 0.5) * (spacing - 2.0 * RADIUS) * 0.8;
                     pos.push(Vec2::new(cx + 0.5, cy + 0.5) * spacing + jitter);
                     goal.push(Vec2::new(unit(k, 100), unit(k, 101)) * extent);
                 }
@@ -332,7 +333,8 @@ impl World {
                     if p.distance(self.goal[a]) < 1.0 {
                         self.legs[a] += 1;
                         let leg = self.legs[a] * 2 + 100;
-                        self.goal[a] = Vec2::new(unit(self.keys[a], leg), unit(self.keys[a], leg + 1)) * self.extent;
+                        self.goal[a] =
+                            Vec2::new(unit(self.keys[a], leg), unit(self.keys[a], leg + 1)) * self.extent;
                     }
                 }
                 Scene::Circle => self.gone[a] |= p.distance(self.goal[a]) < ARRIVE,
@@ -662,7 +664,8 @@ fn arrive(scene: Scene, n: usize) {
         if members.is_empty() {
             break;
         }
-        let solved = crowd.solve(&members, &params, DT, |_, _| true, |i, buf| world.walls(members[i].pos, buf));
+        let solved =
+            crowd.solve(&members, &params, DT, |_, _| true, |i, buf| world.walls(members[i].pos, buf));
         out.clear();
         out.extend_from_slice(solved);
         world.advance(&slots, &out);
@@ -688,7 +691,9 @@ fn arrive(scene: Scene, n: usize) {
 
 fn main() {
     let scenes: Vec<Scene> = match std::env::var("ORCA_SCENES") {
-        Ok(list) => Scene::ALL.into_iter().filter(|s| list.split(',').any(|w| w.trim() == s.name())).collect(),
+        Ok(list) => {
+            Scene::ALL.into_iter().filter(|s| list.split(',').any(|w| w.trim() == s.name())).collect()
+        }
         Err(_) => Scene::ALL.to_vec(),
     };
     let sizes: Vec<usize> = match std::env::var("ORCA_SIZES") {
