@@ -9,8 +9,9 @@
 //! References:
 //! - van den Berg, Lin & Manocha, "Reciprocal Velocity Obstacles for Real-Time Multi-Agent
 //!   Navigation", ICRA 2008, DOI 10.1109/ROBOT.2008.4543489 (reciprocity removes oscillation).
-//! - van den Berg, Guy, Lin & Manocha, "Reciprocal n-Body Collision Avoidance", 2011,
-//!   DOI 10.1109/TRO.2011.2120810 (the ORCA half-plane construction + 2-D linear program below).
+//! - van den Berg, Guy, Lin & Manocha, "Reciprocal n-Body Collision Avoidance", Robotics Research
+//!   (ISRR 2009), Springer STAR 70, 2011, DOI 10.1007/978-3-642-19457-3_1 (the ORCA half-plane
+//!   construction + 2-D linear program below).
 //!
 //! The half-plane construction and the three-stage linear program follow the authors' reference
 //! implementation, **RVO2** (van den Berg et al., Apache-2.0), closely enough that its names are kept
