@@ -2,7 +2,7 @@
 
 Every stem below is a home-still document (`distill_search` / `hs distill search` finds it; `markdown_read` reads it). A source the corpus lacks is listed under **Not in the corpus** with what was tried, so the next pass does not search for it again.
 
-Scanned last: iteration 2 (2026-10-30). `catalog_recent` (200 rows, all social-science and medical embeds) held no new document in these domains; iteration 1's scan found none either.
+Scanned last: iteration 3 (2026-10-30). `catalog_recent` (200 rows, 18:38–18:53 UTC: all medical, sports-science and social-science embeds) held no new document in these domains; iterations 1 and 2 found none either.
 
 ## Velocity obstacles, RVO and ORCA (model)
 
