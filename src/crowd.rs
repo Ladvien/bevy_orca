@@ -9,8 +9,6 @@
 //! The caller still decides the two things that are gameplay: **who is a neighbour**
 //! (`solve`'s `sees`) and **what is solid** (its `walls`). This module never looks at a game type.
 
-use std::collections::HashMap;
-
 use bevy_math::Vec2;
 
 use crate::{Agent, OrcaScratch, new_velocity_in};
@@ -69,16 +67,19 @@ impl CrowdParams {
     }
 }
 
-/// A reusable crowd solver: the spatial hash, the line buffers and the output slice.
+/// A reusable crowd solver: the neighbour grid, the line buffers and the output slice.
 ///
 /// Own one per crowd and call [`solve`](Self::solve) every tick. Nothing in it is per-member state, so
-/// it is safe to solve several crowds with one `Crowd`, one after the other.
+/// it is safe to solve several crowds with one `Crowd`, one after the other. Its buffers grow to the
+/// largest crowd it has solved and never shrink, so once warm it allocates nothing, wherever the crowd
+/// walks.
 #[derive(Debug, Default)]
 pub struct Crowd {
     scratch: OrcaScratch,
-    /// Spatial hash of member indices, `neighbour_range` per cell. Lookup only: every candidate list
-    /// is sorted before use, so no result depends on this map's iteration order.
-    cells: HashMap<(i32, i32), Vec<usize>>,
+    /// The neighbour grid: `(cell key, member index)` for every member with a finite position, sorted,
+    /// `neighbour_range` per cell. Rebuilt every solve, so its size is the crowd's and not the ground
+    /// the crowd has covered. Lookup only: every candidate list is sorted before use.
+    cells: Vec<(u64, usize)>,
     /// Reused candidate buffer: `(distance, key, index)`, sorted nearest-first.
     near: Vec<(f32, u64, usize)>,
     /// Reused neighbour slice handed to the solver.
@@ -89,12 +90,22 @@ pub struct Crowd {
     out: Vec<Option<Vec2>>,
 }
 
-/// One cell of the spatial hash, or `None` when the position is not finite.
+/// One cell of the neighbour grid as `(column, row)`, or `None` when the position is not finite. A
+/// position beyond `±range · 2^31` saturates to the edge cell; the distance test rejects the members
+/// that share it without being in range.
 fn cell_of(pos: Vec2, range: f32) -> Option<(i32, i32)> {
     if !pos.is_finite() || range.is_nan() || range <= 0.0 {
         return None;
     }
     Some(((pos.x / range).floor() as i32, (pos.y / range).floor() as i32))
+}
+
+/// A cell's place in the grid's order: row-major, each coordinate offset from `i32::MIN` so the order
+/// of keys is the order of `(row, column)`. The cells of one row then sit together, and a run of
+/// adjacent columns is one contiguous key range. Both arguments must lie in the `i32` range.
+fn cell_key(column: i64, row: i64) -> u64 {
+    let offset = |v: i64| (v - i64::from(i32::MIN)) as u64;
+    (offset(row) << 32) | offset(column)
 }
 
 /// The SplitMix64 output mix. A stable hash of the caller's key, so the side a head-on member steps to
@@ -128,16 +139,17 @@ impl Crowd {
         let range = params.neighbour_range;
         let search = range > 0.0 && range.is_finite();
 
-        // Rebuild the hash. Each cell's list is cleared rather than dropped, so a crowd that stays in
-        // the same place tick after tick stops allocating once the map is wide enough.
-        for list in self.cells.values_mut() {
-            list.clear();
-        }
-        for (i, m) in members.iter().enumerate() {
-            let Some(cell) = cell_of(m.pos, range).filter(|_| search) else {
-                continue;
-            };
-            self.cells.entry(cell).or_default().push(i);
+        // Rebuild the grid: one entry per member, sorted by cell. The pairs are unique, so the sorted
+        // order is fully determined, and the buffer is cleared rather than dropped, so a warm `Crowd`
+        // allocates nothing here however far its members have walked.
+        self.cells.clear();
+        if search {
+            for (i, m) in members.iter().enumerate() {
+                if let Some((column, row)) = cell_of(m.pos, range) {
+                    self.cells.push((cell_key(i64::from(column), i64::from(row)), i));
+                }
+            }
+            self.cells.sort_unstable();
         }
 
         self.out.clear();
@@ -157,23 +169,30 @@ impl Crowd {
             // property of the world rather than of the input slice's order.
             self.near.clear();
             if search && let Some((cx, cy)) = cell_of(m.pos, range) {
-                for dx in -1..=1 {
-                    for dy in -1..=1 {
-                        let Some(list) = self.cells.get(&(cx + dx, cy + dy)) else {
+                // The 3×3 block around this member's cell, one row at a time: a row's three cells are
+                // one key range. Neighbouring rows and columns are taken in `i64` and kept inside the
+                // `i32` range, so a member in a saturated edge cell looks only at real cells.
+                let (lowest, highest) = (i64::from(i32::MIN), i64::from(i32::MAX));
+                let (cx, cy) = (i64::from(cx), i64::from(cy));
+                let (first_column, last_column) = ((cx - 1).max(lowest), (cx + 1).min(highest));
+                for row in (cy - 1).max(lowest)..=(cy + 1).min(highest) {
+                    let (from, to) = (cell_key(first_column, row), cell_key(last_column, row));
+                    let start = self.cells.partition_point(|&(key, _)| key < from);
+                    let end = self.cells.partition_point(|&(key, _)| key <= to);
+                    let Some(run) = self.cells.get(start..end) else {
+                        continue;
+                    };
+                    for &(_, j) in run {
+                        if j == i {
                             continue;
-                        };
-                        for &j in list {
-                            if j == i {
-                                continue;
-                            }
-                            let other = members[j];
-                            let dist = other.pos.distance(m.pos);
-                            if dist > range {
-                                continue;
-                            }
-                            if sees(i, j) {
-                                self.near.push((dist, other.key, j));
-                            }
+                        }
+                        let other = members[j];
+                        let dist = other.pos.distance(m.pos);
+                        if dist > range {
+                            continue;
+                        }
+                        if sees(i, j) {
+                            self.near.push((dist, other.key, j));
                         }
                     }
                 }
@@ -381,5 +400,20 @@ mod tests {
         let solved = crowd.solve(&members, &params, 1.0 / 60.0, |_, _| true, |_, buf| buf.clear());
         assert_eq!(solved[0], None);
         assert_eq!(solved[1], Some(-Vec2::X), "the broken member must not be a neighbour");
+    }
+
+    /// A finite position far enough out saturates its cell index at `i32::MAX` or `i32::MIN`; the
+    /// cells beside it must still be looked up without overflowing, in a debug build as in release.
+    #[test]
+    fn a_member_at_the_edge_of_the_float_range_is_solved_without_panicking() {
+        let params = CrowdParams::new(3.0);
+        let mut crowd = Crowd::default();
+        let members = [
+            member(1, Vec2::new(1.0e30, -1.0e30), Vec2::ZERO, Some(Vec2::X)),
+            member(2, Vec2::new(f32::MAX, f32::MAX), Vec2::ZERO, Some(-Vec2::X)),
+            member(3, Vec2::new(-f32::MAX, 0.0), Vec2::ZERO, Some(Vec2::Y)),
+        ];
+        let solved = crowd.solve(&members, &params, 1.0 / 60.0, |_, _| true, |_, buf| buf.clear());
+        assert_eq!(solved, [Some(Vec2::X), Some(-Vec2::X), Some(Vec2::Y)], "nobody is near anybody");
     }
 }
