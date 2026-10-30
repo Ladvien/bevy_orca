@@ -63,6 +63,14 @@ None new. The cell stays `neighbour_range` (the optimum the STAR cites for a que
 - The bench's hashes are unchanged at every scene, size, member order and thread count; `cand_mean` and `cand_max` are unchanged.
 - No case's median step regresses more than 5%; the scaling exponent does not rise.
 
+Measured in iteration 1 (bench on big at load 55–64; timing from three interleaved base/new runs):
+
+- The moving-crowd test: 203 allocations → 0. The debug-build overflow test passes.
+- Bench `allocs` over 480 timed steps: 4–25 804 → 1–9. Each remaining allocation falls on a step where the widest candidate list or LP buffer first reached a new size (17, 33, 65 candidates — the 16/32/64 doubling points), so it is a buffer growing, not a per-step cost; the target above was worded too strongly.
+- Hashes and `cand_mean` / `cand_max` unchanged in every case, in the full-Bevy example build and in a consumer's `nostd-libm` build.
+- Median step, base → new: open 1k 1 490 → 1 422 µs, 10k 12 617 → 11 443; circle 1k 434 → 381, 10k 4 158 → 3 926; corridor 1k 782 → 707, 10k 8 258 → 8 129; bottleneck 1k 2 871 → 2 793, 10k 20 280 → 20 296. No case slower than noise (worst +0.1%).
+- Scaling exponent 1k→10k: open 0.928 → 0.906, circle 0.981 → 1.013, corridor 1.024 → 1.060, bottleneck 0.849 → 0.861 — the rises are the 1 000-agent cases gaining more than the 10 000-agent ones; every absolute time fell or held (bottleneck 10k +0.1%), and all stay under 1.15.
+
 ## What great looks like
 
 A host can walk a crowd across a world of any size for an hour and the solver's memory and per-step cost are a function of how many members it has, not of where they have been; a stray far-off position in a debug build is just a member nobody is near.

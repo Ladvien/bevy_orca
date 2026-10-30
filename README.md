@@ -77,7 +77,7 @@ for (member, v) in members.iter().zip(solved) {
 
 The caller still owns the two gameplay decisions — **who is a neighbour** (`sees`) and **what is solid** (`walls`). `Crowd` only decides how they are found and how they are solved. `key` is what makes the result a property of the world rather than of your iteration order: candidates sort by `(distance, key)`, and a head-on meeting steps to a side hashed from each member's own key, so two agents do not pick the same side and stall.
 
-`Crowd` allocates nothing after its buffers are warm. `CrowdParams::new(range)` gives a 2-second horizon, at most 10 neighbours and a 5% nudge; set `nudge` to `0.0` to keep perfectly symmetric input perfectly symmetric.
+`Crowd` allocates nothing after its buffers are warm, wherever the crowd walks: its neighbour grid is one entry per member, sorted by cell and rebuilt every solve, so its memory and its cost follow how many members there are and not how much ground they have covered. `CrowdParams::new(range)` gives a 2-second horizon, at most 10 neighbours and a 5% nudge; set `nudge` to `0.0` to keep perfectly symmetric input perfectly symmetric.
 
 ## Units and plane
 
@@ -105,10 +105,13 @@ Pure arithmetic, no RNG, no interior mutability. Identical inputs give bit-ident
 ```sh
 cargo run -p bevy_orca --example head_on        # terminal: reciprocity, each side takes half
 cargo run -p bevy_orca --example wall_corridor  # terminal: walls hard, neighbours soft
+cargo run -p bevy_orca --release --example bench  # terminal: what a crowd step costs, 100 to 10 000 agents
 cargo run -p bevy_orca --example circle_swap    # the gif above. Needs a GPU.
 ```
 
 `head_on` and `wall_corridor` print to the terminal — no window, no GPU, nothing to install. `head_on` walks two agents into each other and prints the lateral offset each takes, then repeats it with the neighbour holding ground so you can see the mover absorb the whole avoidance. `wall_corridor` adds wall half-planes and reports the deepest penetration, which stays at zero.
+
+`bench` is the measuring instrument. It times one `Crowd::solve` step in four scenes — an open field of walkers, the circle swap, a two-way corridor with walls and a room draining through a gap two agents wide — at 100, 1 000, 5 000 and 10 000 agents, and prints one line per case: median and p99 step time, agents per millisecond, neighbour candidates per agent, the deepest overlap and wall penetration, allocations inside the solve, and a hash of the final state that must be equal whether the members are given forwards, reversed, or solved by a caller's own parallel loop over `new_velocity_in`. `ORCA_SCENES=open,corridor` and `ORCA_SIZES=100,1000` narrow it.
 
 `circle_swap` is the picture. Two things in it are worth knowing before you tune this in your own game, because both were found by watching it fail:
 
