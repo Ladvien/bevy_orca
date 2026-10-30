@@ -50,6 +50,9 @@ Scanned last: iteration 3 (2026-10-30). `catalog_recent` (200 rows, 18:38–18:5
 - `10.48550_arXiv.1312.3300` — "Numerical Reproducibility and Parallel Computations" (reproducibility across thread counts).
 - `PBR3_03_Shapes`, `PBR3_11_Volume_Scattering` — Pharr, Jakob & Humphreys, *Physically Based Rendering* 3rd ed.: IEEE NaN and infinity semantics in geometric tests (NaN comparisons are false; `0 · ∞` is NaN and propagates).
 - `book_real_time_collision_detection_ericson` ch. 11, "Numerical Robustness": INF/NaN in intersection tests must answer "no intersection".
+- `10.1007_s10543-023-00975-x` — Bartels, Fisikopoulos & Weiser, "Fast floating-point filters for robust predicates", *BIT Numerical Mathematics* (catalog date 2022-07-31). Round-off in geometric predicates, floating-point filters before exact arithmetic. Found by `distill_search` in iteration 3 (not via `catalog_recent`).
+- `book_geometric_tools_computer_graphics_schneider` p. 46 — cancellation and division by near-zero in the quadratic formula (the line–disc discriminant of `linear_program1`).
+- RVO2 (`snape/RVO2` on GitHub, not a home-still document) — the reference implementation; built from source in iteration 3 to compare its circle swap and its speed bound with this crate's.
 
 ## Not in the corpus
 
