@@ -71,8 +71,8 @@ impl CrowdParams {
 ///
 /// Own one per crowd and call [`solve`](Self::solve) every tick. Nothing in it is per-member state, so
 /// it is safe to solve several crowds with one `Crowd`, one after the other. Its buffers grow to the
-/// largest crowd it has solved and never shrink, so once warm it allocates nothing, wherever the crowd
-/// walks.
+/// largest crowd and the longest candidate list it has solved and never shrink, so once warm it
+/// allocates nothing, wherever the crowd walks and however tightly it packs.
 #[derive(Debug, Default)]
 pub struct Crowd {
     scratch: OrcaScratch,

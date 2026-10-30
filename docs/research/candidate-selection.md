@@ -77,6 +77,14 @@ None new. `max_neighbours` and `neighbour_range` keep their meaning and defaults
 - Every bench hash — every scene, size, member order and thread count — equal to the baseline's; `cand_mean` and `cand_max` unchanged (the same candidates are found and offered to `sees`).
 - Cost: no case's median step more than 5% slower; the scaling exponent does not rise; the rally's step falls.
 
+Measured in iteration 3 (big, 16 cores, load 18–50 from other loops):
+
+- The dense-crowd test: 1 000 allocations on the baseline code (the issue's own prediction) → 0.
+- Bench `rally` `allocs` over 480 timed steps, 100 / 1 000 / 5 000 / 10 000 members: 0 / 260 619 / 1 878 557 / 4 050 400 → 0 / 2 / 2 / 2. Every other scene unchanged (1–9, buffer growth).
+- Hashes: one per case across 80 cases × 9 runs (baseline, interleaved baseline and new; fwd/rev; threads 1/2/16), baseline = new; the full-Bevy example build agrees with a consumer's `nostd-libm` build. `cand_mean` / `cand_max` identical everywhere.
+- Cost, in-process A/B on frozen states (both crates in one binary, alternating order; median): rally −59% at 1 000 and 10 000 (min −55%); circle −2% to −3%; corridor −0.6% to +0.6%; open −1% to −3%. Interleaved bench medians agree for the rally (−45% to −61%) and show the bottleneck −23% to −42% (cand_mean 32–51), but swing ±20% run to run at this load, so the A/B is the figure of record.
+- Scaling: the bench's rally exponent rose 1.107 → 1.195; on frozen states it is 1.065 → 1.061. The bench's 10 000-member rally compresses further over 500 steps (cand_mean 204.6 against 170.8 at 1 000), so its exponent measures density as well as size. Every rally time fell.
+
 ## What great looks like
 
 A strategy game rallies ten thousand units on one flag with a 5 m neighbour range. Each unit pays for finding its ten nearest, not for ordering the two hundred around it, and the tick never calls the allocator — the frame-time graph is flat when the army bunches up, the same as when it is spread out. Nothing visible changes: every agent takes exactly the velocity it took before.
