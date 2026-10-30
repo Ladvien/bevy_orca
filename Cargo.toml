@@ -1,6 +1,6 @@
 [package]
 name = "bevy_orca"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.97.1"
 description = "Reciprocal Velocity Obstacles (ORCA) local collision avoidance on bevy_math's Vec2 — the 2-D linear program, no ECS."
