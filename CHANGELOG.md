@@ -4,9 +4,14 @@ All notable changes to this crate are recorded here. The format follows [Keep a 
 
 ## [Unreleased]
 
+### Added
+
+- `examples/bench.rs`: a fifth scene, `rally` — units hex-packed around one point with a 5 m neighbour range, about 200 candidates per member at 10 000 agents — so the bench measures a packed crowd, where choosing the neighbours costs more than solving for them.
+
 ### Fixed
 
 - `new_velocity_in` (and so `new_velocity` and `Crowd::solve`) returned NaN or infinite velocities, despite "the result is always finite", for input its guards did not look at: an agent's own non-finite velocity or radius, a neighbour's non-finite or negative-radius state, a non-finite or non-unit wall, a `max_speed` above about `1.8e19`, a subnormal `dt` or `time_horizon`, and finite values whose arithmetic overflows `f32` (agents near `±f32::MAX`). A hostile sweep found 6 505 non-finite answers in 200 000 single solves and 1 709 in 20 000 crowd steps; it now finds none. Each case has one documented answer: an agent with unusable own state, or an unusable wall, holds still (`Vec2::ZERO`); an unusable neighbour, or one whose constraint overflows, is skipped; a `max_speed` whose square overflows gives `Vec2::ZERO`; a `dt` or `time_horizon` whose reciprocal overflows means no time passes. Finite, in-range input is bit-identical to before.
+- `Crowd::solve` allocated once per member per tick whenever more than 170 candidates were in range, despite "`Crowd` allocates nothing after its buffers are warm" (#7): the candidate list was ordered with the standard library's stable sort, which takes a heap scratch above 4 KiB. A packed crowd — a rally point, a spawn cluster, a queue — reaches that with an ordinary range: 260 619 allocations in 480 warm steps of the bench's 1 000-member rally. Only the nearest `max_neighbours` candidates are now selected and sorted, both in place; the order is the same strict `(distance, key, index)`, so every neighbour list and every solved velocity is bit-identical, and the rally's step is cheaper.
 
 ### Changed
 

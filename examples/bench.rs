@@ -1,11 +1,14 @@
 //! **The crowd bench: what one `Crowd::solve` step costs a host, and what it gets right.**
 //!
-//! Four scenes, each at 100, 1 000, 5 000 and 10 000 agents:
+//! Five scenes, each at 100, 1 000, 5 000 and 10 000 agents:
 //!
 //! - `open` — random walkers at 0.5 agents/m², each walking to goals drawn from its own key;
 //! - `circle` — the circle swap, every agent walking to its antipode, 1 m of ring per agent;
 //! - `corridor` — a 6 m wide two-way corridor with wall half-planes, the two directions interleaved;
-//! - `bottleneck` — a room at 1 agent/m² draining through a gap two agents wide in a wall.
+//! - `bottleneck` — a room at 1 agent/m² draining through a gap two agents wide in a wall;
+//! - `rally` — units gathered at a rally point: hex-packed 6 cm apart (2.65 agents/m²), every one
+//!   pressing toward the centre, with a 5 m neighbour range, so at 10 000 agents a member has about
+//!   200 others in range to choose its 10 neighbours from.
 //!
 //! Each case runs 20 warm-up steps and 480 timed ones, then prints one line:
 //!
@@ -60,6 +63,10 @@ const SIZES: [usize; 4] = [100, 1_000, 5_000, 10_000];
 const ARRIVE: f32 = 0.5;
 const CORRIDOR_WIDTH: f32 = 6.0;
 const GAP: f32 = 1.4;
+/// The rally's neighbour range: wide enough that a packed member has hundreds of candidates.
+const RALLY_RANGE: f32 = 5.0;
+/// Centre-to-centre spacing of the rally's hex lattice: discs 6 cm apart.
+const RALLY_SPACING: f32 = 2.0 * RADIUS + 0.06;
 
 // ---------------------------------------------------------------------------------------------
 // Allocation counter: per thread, so a worker thread's spawn does not count against the solve.
@@ -139,10 +146,11 @@ enum Scene {
     Circle,
     Corridor,
     Bottleneck,
+    Rally,
 }
 
 impl Scene {
-    const ALL: [Scene; 4] = [Scene::Open, Scene::Circle, Scene::Corridor, Scene::Bottleneck];
+    const ALL: [Scene; 5] = [Scene::Open, Scene::Circle, Scene::Corridor, Scene::Bottleneck, Scene::Rally];
 
     fn name(self) -> &'static str {
         match self {
@@ -150,7 +158,13 @@ impl Scene {
             Scene::Circle => "circle",
             Scene::Corridor => "corridor",
             Scene::Bottleneck => "bottleneck",
+            Scene::Rally => "rally",
         }
+    }
+
+    /// The neighbour range the scene is solved with.
+    fn range(self) -> f32 {
+        if self == Scene::Rally { RALLY_RANGE } else { RANGE }
     }
 }
 
@@ -253,6 +267,19 @@ impl World {
                 segments.push(Segment { a: Vec2::new(0.0, GAP * 0.5), b: Vec2::new(0.0, far) });
                 segments.push(Segment { a: Vec2::new(0.0, -GAP * 0.5), b: Vec2::new(0.0, -far) });
             }
+            Scene::Rally => {
+                // A hex lattice in a square block centred on the rally point at the origin.
+                let side = (n as f32).sqrt().ceil() as usize;
+                let row_step = RALLY_SPACING * 3f32.sqrt() * 0.5;
+                let rows = n.div_ceil(side);
+                let centre = Vec2::new(side as f32 * RALLY_SPACING, rows as f32 * row_step) * 0.5;
+                for i in 0..n {
+                    let (c, r) = (i % side, i / side);
+                    let shift = if r % 2 == 1 { RALLY_SPACING * 0.5 } else { 0.0 };
+                    pos.push(Vec2::new(c as f32 * RALLY_SPACING + shift, r as f32 * row_step) - centre);
+                    goal.push(Vec2::ZERO);
+                }
+            }
         }
         World {
             scene,
@@ -274,7 +301,7 @@ impl World {
         let p = self.pos[a];
         match self.scene {
             Scene::Open => (self.goal[a] - p).normalize_or_zero() * SPEED,
-            Scene::Circle | Scene::Corridor => (self.goal[a] - p).clamp_length_max(SPEED),
+            Scene::Circle | Scene::Corridor | Scene::Rally => (self.goal[a] - p).clamp_length_max(SPEED),
             // Aim at the gap until through it, then straight on.
             Scene::Bottleneck => {
                 if p.x < 0.0 {
@@ -290,7 +317,7 @@ impl World {
     /// approach is the remaining clearance over `dt`, which cannot be crossed in one step.
     fn walls(&self, p: Vec2, buf: &mut Vec<(Vec2, f32)>) {
         match self.scene {
-            Scene::Open | Scene::Circle => {}
+            Scene::Open | Scene::Circle | Scene::Rally => {}
             Scene::Corridor => {
                 let half = CORRIDOR_WIDTH * 0.5;
                 buf.push((Vec2::Y, (half - p.y - RADIUS).max(0.0) / DT));
@@ -312,7 +339,7 @@ impl World {
     fn wall_depth(&self, a: usize) -> f32 {
         let p = self.pos[a];
         match self.scene {
-            Scene::Open | Scene::Circle => 0.0,
+            Scene::Open | Scene::Circle | Scene::Rally => 0.0,
             Scene::Corridor => (p.y.abs() + RADIUS - CORRIDOR_WIDTH * 0.5).max(0.0),
             Scene::Bottleneck => {
                 self.segments.iter().map(|s| (RADIUS - s.closest(p).distance(p)).max(0.0)).fold(0.0, f32::max)
@@ -342,6 +369,8 @@ impl World {
                 Scene::Circle => self.gone[a] |= p.distance(self.goal[a]) < ARRIVE,
                 Scene::Corridor => self.gone[a] |= p.x.abs() > self.extent * 0.5 + 0.5,
                 Scene::Bottleneck => self.gone[a] |= p.x > 3.0,
+                // Nobody leaves a rally: the press on its centre is the scene.
+                Scene::Rally => {}
             }
             if !self.gone[a] {
                 if self.vel[a].length() < 0.05 * SPEED {
@@ -413,6 +442,12 @@ fn cell_of(pos: Vec2, range: f32) -> Option<(i32, i32)> {
         return None;
     }
     Some(((pos.x / range).floor() as i32, (pos.y / range).floor() as i32))
+}
+
+/// The order `Crowd` keeps candidates in: distance, then key, then index. The index makes it a strict
+/// total order, so an unstable selection and sort give the one result a stable sort would.
+fn nearest_first(a: &(f32, u64, usize), b: &(f32, u64, usize)) -> std::cmp::Ordering {
+    a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2))
 }
 
 impl Grid {
@@ -490,10 +525,14 @@ fn solve_parallel(
                     });
                     w.candidates += w.near.len();
                     w.candidates_max = w.candidates_max.max(w.near.len());
-                    w.near.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
-                    let keep = params.max_neighbours.min(w.near.len());
+                    let keep = params.max_neighbours;
+                    if keep < w.near.len() {
+                        w.near.select_nth_unstable_by(keep, nearest_first);
+                        w.near.truncate(keep);
+                    }
+                    w.near.sort_unstable_by(nearest_first);
                     w.neighbours.clear();
-                    for &(_, _, j) in &w.near[..keep] {
+                    for &(_, _, j) in &w.near {
                         let other = members[j];
                         w.neighbours.push(Agent {
                             pos: other.pos,
@@ -502,7 +541,7 @@ fn solve_parallel(
                             avoids: other.pref_vel.is_some(),
                         });
                     }
-                    let wish = if keep == 0 {
+                    let wish = if w.near.is_empty() {
                         pref
                     } else {
                         let side = if splitmix64(m.key) & 1 == 0 { 1.0 } else { -1.0 };
@@ -545,7 +584,7 @@ struct Outcome {
 /// 20 warm-up and 480 timed steps of one scene. `threads == 0` is `Crowd::solve`; otherwise the
 /// caller's parallel ring on that many workers. `measure` adds the overlap and wall checks.
 fn run(scene: Scene, n: usize, threads: usize, reversed: bool, measure: bool) -> Outcome {
-    let params = CrowdParams::new(RANGE);
+    let params = CrowdParams::new(scene.range());
     let mut world = World::new(scene, n);
     let mut crowd = Crowd::default();
     let mut members = Vec::new();
