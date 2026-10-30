@@ -2,7 +2,7 @@
 
 Every stem below is a home-still document (`distill_search` / `hs distill search` finds it; `markdown_read` reads it). A source the corpus lacks is listed under **Not in the corpus** with what was tried, so the next pass does not search for it again.
 
-Scanned last: iteration 3 (2026-10-30). `catalog_recent` (200 rows, 21:00–21:06 UTC, nearly all LLM and graphics arXiv embeds) held one document in these domains, `10.48550_arxiv.2210.04624` (below), and one on sorting, `10.48550_arxiv.2206.01784`; iterations 1 and 2 found none.
+Scanned last: iteration 3 (2026-10-30), twice. `catalog_recent` (200 rows, 21:00–21:06 UTC, nearly all LLM and graphics arXiv embeds) held one document in these domains, `10.48550_arxiv.2210.04624` (below), and one on sorting, `10.48550_arxiv.2206.01784`; a second scan (200 rows, 21:18–21:27 UTC, LLM-agent-memory arXiv embeds only) held none in these domains (`10.48550_arxiv.math_9410209`, Edelsbrunner & Mücke's "Simulation of simplicity", is the only geometry row and is about degenerate inputs to exact predicates, not this crate's float LP). Iterations 1 and 2 found none.
 
 ## Velocity obstacles, RVO and ORCA (model)
 
