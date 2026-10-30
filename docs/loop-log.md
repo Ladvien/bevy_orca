@@ -50,6 +50,8 @@ No open issue, so the backlog is the crate's own, ranked by section 4 of the com
 
 **Clean-up.** Removed `~/o1_base` (worktree, 760 K), `~/o1_base-target` (76 M), `/tmp/o1/check` (209 M), `/tmp/o1/cmp_base`, `/tmp/o1/cmp_new` (77 M); `df -h /home` 345 G free before and after (under a gigabyte freed). `/tmp/o1` (272 K of text evidence) is removed at the end of the pass. No leftovers from earlier passes: `git worktree list` shows the clone only.
 
+**Release.** `cargo semver-checks check-release`: no semver update required (202 checks pass), so a patch: **bevy_orca 0.2.1**, published from `ecb765d` (`release: v0.2.1`, tag `v0.2.1`), https://crates.io/crates/bevy_orca/0.2.1 (`cargo info bevy_orca@0.2.1` resolves). Merge commit `6f336cb`; the gate passed on the merged tree before the push.
+
 ### Ranked backlog
 
 1. **NaN out of `new_velocity_in` / `Crowd::solve` on non-finite agent or neighbour state** (bug; README promises "always finite"): 175 of 9 013 hostile crowd solves, 39 of 10 000 single solves (NaN/inf velocity, NaN radius, ±`f32::MAX` positions whose differences overflow). Decide what an unusable own state returns and whether an unusable neighbour or wall is skipped; add the hostile sweep as a permanent test.
