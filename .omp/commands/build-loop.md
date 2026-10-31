@@ -436,3 +436,5 @@ made this pass, and list what earlier passes left.
 - No feature ships without a written critique, a GREAT verdict and a clean performance check.
 - If blocked, log the blocker and pick the next item. A failed gate or a visible defect is not a
   blocker: fix it. A failed push or merge is: log the exact error and stop. Never force-push.
+
+README and docs follow https://github.com/bevy-coven/.github/blob/main/DOCUMENTATION.md; a feature is not done until its README line and, if visible, its GIF exist.

@@ -37,3 +37,5 @@ cargo test --all-features    # the optional derives, and the same tests
 ## In the monorepo
 
 The game reaches this as `crate::orca` in its monorepo, `foundation_vs_slop/crates/bevy_orca/`, which is frozen on Bevy 0.19. This repository is where changes land; the monorepo copy is not updated. Do not push over this repository from the monorepo's `scripts/mirror_crates.sh`.
+
+README and docs follow https://github.com/bevy-coven/.github/blob/main/DOCUMENTATION.md; a feature is not done until its README line and, if visible, its GIF exist.
