@@ -52,7 +52,8 @@ pub struct CrowdMember {
     /// the street should walk around is given more than the walkers. It is not an immovable member:
     /// that is `pref_vel: None` or a `max_speed` of `0`, which everyone avoids in full whatever this
     /// says. NaN or negative counts as `0` (the member gives way), `∞` as the right of way over any
-    /// finite priority. See [`Agent::priority`].
+    /// finite priority; members whose discs overlap push apart evenly whatever their priorities. See
+    /// [`Agent::priority`].
     pub priority: f32,
 }
 
