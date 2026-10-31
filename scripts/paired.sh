@@ -34,7 +34,13 @@ TOML
 
 for name in orca_a1 orca_a2; do
   mkdir -p "$work/$name"
+  # `git archive` stamps every file with the commit's time. Cargo treats a path dependency as fresh
+  # when its sources are older than its build, and the package ids of the copies are the same in every
+  # run (their paths are taken relative to the workspace), so a base older than an earlier run's base
+  # would be answered with that run's artifact in a shared `CARGO_TARGET_DIR`: a compile error at best
+  # and a comparison against the wrong commit at worst. Touching the files makes them newer.
   git -C "$root" archive "$ref" src | tar -x -C "$work/$name"
+  find "$work/$name/src" -type f -exec touch {} +
   manifest "$name"
 done
 for name in orca_b1 orca_b2; do
