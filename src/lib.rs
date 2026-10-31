@@ -16,7 +16,11 @@
 //! The half-plane construction and the three-stage linear program follow the authors' reference
 //! implementation, **RVO2** (van den Berg et al., Apache-2.0), closely enough that its names are kept
 //! — `linear_program1`/`linear_program2`/`linear_program3`, `t_left`/`t_right`, and `RVO_EPSILON` as
-//! `EPSILON` — so the two can be read side by side. See `NOTICE`.
+//! `EPSILON` — so the two can be read side by side. See `NOTICE`. One numerical change: every line is
+//! stored at its point nearest the origin, and `linear_program3` builds its projected lines from the
+//! two lines' distances to the origin rather than through their intersection. The half-planes are
+//! RVO2's; the answer stays inside the speed disc to `f32` rounding, which RVO2's does not (it can
+//! leave it by many times `max_speed` when two constraints are nearly parallel).
 //!
 //! # Scope
 //!
@@ -58,10 +62,36 @@ impl Default for Agent {
 }
 
 /// A half-plane constraint `{ v : det(direction, v - point) >= 0 }` on the new velocity.
+///
+/// `direction` is a unit vector and `point` is the line's point nearest the origin. Every stage of the
+/// linear program relies on both: a line stored through a far point (two nearly parallel lines meet
+/// far away) makes `linear_program1`'s disc test subtract two huge, nearly equal squares, and its
+/// answer `point + t · direction` the sum of two huge, nearly opposite vectors — both catastrophic
+/// cancellation, which is how RVO2's answer leaves the speed disc. Stored at its foot, every number
+/// the test and the answer use is no larger than the disc for any line that can cut it.
+///
+/// The one exception is a neighbour's line whose direction came out as zero (its relative velocity
+/// sits within `EPSILON` of the cutoff circle's centre): `det(ZERO, ·)` is zero, so no velocity ever
+/// violates it, and its point is the origin.
 #[derive(Debug, Clone, Copy)]
 struct Line {
     point: Vec2,
     direction: Vec2,
+}
+
+impl Line {
+    /// The line through `point` along the unit `direction`, stored at its point nearest the origin:
+    /// `det(direction, point)` is its signed distance from the origin, the one number that fixes it.
+    #[inline]
+    fn anchored(point: Vec2, direction: Vec2) -> Line {
+        Line { point: det(direction, point) * direction.perp(), direction }
+    }
+
+    /// The line's signed distance from the origin, `det(direction, point)`.
+    #[inline]
+    fn offset(&self) -> f32 {
+        det(self.direction, self.point)
+    }
 }
 
 /// Reusable buffers for [`new_velocity_in`], so a caller solving for a crowd allocates nothing after
@@ -90,14 +120,18 @@ pub(crate) fn usable_state(pos: Vec2, vel: Vec2, radius: f32) -> bool {
     pos.is_finite() && vel.is_finite() && radius.is_finite() && radius >= 0.0
 }
 
-/// Whether `max_speed` leaves an agent a velocity it may take at all: positive, and not so large
-/// that its square, which every line test uses as the speed disc's `radius²`, overflows `f32`. A NaN
-/// is not positive. [`new_velocity_in`] answers [`Vec2::ZERO`] when this is false, and [`Crowd`]
-/// offers such a member to its neighbours as one that will not step aside; they are one test so the
-/// two cannot disagree.
+/// Whether `max_speed` leaves an agent a velocity it may take at all: positive, and its square, which
+/// every line test uses as the speed disc's `radius²`, a normal `f32`. A square that overflowed (a
+/// `max_speed` above about `1.8e19`) is not a number to compare with, and one that underflowed (below
+/// about `1.1e-19`, where the square is subnormal or zero) can no longer tell a wish from the bound,
+/// so a wish `1e-38` long would pass unclamped through a speed limit of `1e-40`. A NaN is not
+/// positive. [`new_velocity_in`] answers [`Vec2::ZERO`] when this is false, and [`Crowd`] offers such
+/// a member to its neighbours as one that will not step aside; they are one test so the two cannot
+/// disagree.
 #[inline]
 pub(crate) fn usable_speed(max_speed: f32) -> bool {
-    max_speed > 0.0 && (max_speed * max_speed).is_finite()
+    let square = max_speed * max_speed;
+    max_speed > 0.0 && square.is_finite() && square >= f32::MIN_POSITIVE
 }
 
 /// `2^-96`: the power of two [`direction_of`] scales a vector by when its square is not a number.
@@ -124,10 +158,13 @@ fn direction_of(v: Vec2) -> Vec2 {
 /// Compute the collision-avoiding velocity for `agent` nearest to `pref_vel`, given `neighbors`.
 ///
 /// `time_horizon` is how many seconds ahead agent-agent collisions are anticipated (larger = more
-/// cautious, earlier avoidance); `dt` is the simulation step (used for the in-contact case); result
-/// magnitude is clamped to `max_speed`: with nothing in the way a `pref_vel` longer than that is cut
-/// to `max_speed` along its own direction, however long it is — `(1e20, 0)` at a `max_speed` of `1.5`
-/// gives `(1.5, 0)`, not a stop. Pure math — no panics.
+/// cautious, earlier avoidance); `dt` is the simulation step (used for the in-contact case). The
+/// result is never faster than `max_speed`, to `f32` rounding (a relative `1e-6`), for any finite
+/// input — however dense the neighbours, however nearly parallel their constraints, however fast the
+/// agent's own velocity: the speed disc is a constraint of the linear program, not a clamp after it.
+/// With nothing in the way a `pref_vel` longer than `max_speed` is cut to it along its own direction,
+/// however long it is — `(1e20, 0)` at a `max_speed` of `1.5` gives `(1.5, 0)`, not a stop. Pure
+/// math — no panics.
 ///
 /// Allocates a fresh line buffer per call. To solve repeatedly without allocating, own an
 /// [`OrcaScratch`] and call [`new_velocity_in`].
@@ -158,8 +195,9 @@ pub fn new_velocity(
 /// `Transform` makes its agent vanish for good. Every input the solve cannot use gets one documented
 /// answer, in this order:
 ///
-/// - `max_speed` not finite, `<= 0`, or so large that its square overflows `f32` (above about
-///   `1.8e19`) → [`Vec2::ZERO`]: there is no velocity this agent may take.
+/// - `max_speed` not finite, `<= 0`, so large that its square overflows `f32` (above about `1.8e19`),
+///   or so small that its square is not a normal number (below about `1.1e-19`) → [`Vec2::ZERO`]:
+///   there is no velocity this agent may take.
 /// - `pref_vel` not finite → [`Vec2::ZERO`]: the preference itself is unusable.
 /// - the agent's own `pos` or `vel` not finite, or its `radius` negative or not finite →
 ///   [`Vec2::ZERO`]: it has no velocity obstacle to solve with, so it holds still. A caller that
@@ -176,7 +214,9 @@ pub fn new_velocity(
 /// A `radius` of `0` is a point, and usable. So is any finite `pref_vel`, including one too long to
 /// square (above about `1.8e19`): it is clamped to the speed disc along its own direction. Finite,
 /// in-range input passes every one of these tests, so none of them changes a single bit of a sane
-/// solve.
+/// solve. Whatever the input, a velocity this function returns is inside the speed disc to `f32`
+/// rounding: the disc is a constraint of the linear program, not a clamp after it (see
+/// [`new_velocity`]).
 // A solver's parameters are what the caller decides per step, and bundling them into a struct would
 // allocate a place to copy them into on every call — the opposite of this function's point. The eight
 // arguments mirror RVO2's `computeNewVelocity` and `new_velocity`'s own seven.
@@ -234,12 +274,19 @@ pub fn new_velocity_in(
     // to contact, but never accelerate *through* the wall — so ORCA won't dodge a neighbor by
     // steering into a wall and stalling. Actual contact is still the caller's collision resolver.
     for &(b, approach) in walls {
-        let point = approach * b;
         // A hard constraint that is not a half-plane cannot be dropped like a neighbour: hold still.
-        if !b.is_normalized() || !point.is_finite() {
+        if !b.is_normalized() {
             return Vec2::ZERO;
         }
-        lines.push(Line { point, direction: Vec2::new(-b.y, b.x) });
+        // `is_normalized` allows `|b|` within about 1e-4 of 1; dividing it out makes the half-plane
+        // exactly `v · b <= approach` and its direction a unit vector, as every stage of the program
+        // assumes. The line is then at its foot already: `approach · b` is its point nearest the origin.
+        let b = b / b.length();
+        let point = approach * b;
+        if !point.is_finite() {
+            return Vec2::ZERO;
+        }
+        lines.push(Line { point, direction: b.perp() });
     }
     let num_obstacle = lines.len();
 
@@ -304,12 +351,15 @@ pub fn new_velocity_in(
         // that don't (idle units holding ground).
         let responsibility = if other.avoids { 0.5 } else { 1.0 };
         let point = agent.vel + responsibility * u;
-        // Finite input can still overflow `f32` (two agents near `±f32::MAX`, a radius near it): a
-        // constraint the arithmetic cannot represent is as far out of reach as one out of range.
-        if !point.is_finite() || !direction.is_finite() {
+        // Stored at its point nearest the origin, so a constraint built from a fast own velocity does
+        // not carry that speed into the disc test. Finite input can still overflow `f32` (two agents
+        // near `±f32::MAX`, a radius near it): a constraint the arithmetic cannot represent is as far
+        // out of reach as one out of range.
+        let line = Line::anchored(point, direction);
+        if !line.point.is_finite() || !direction.is_finite() {
             continue;
         }
-        lines.push(Line { point, direction });
+        lines.push(line);
     }
 
     let mut result = pref_vel;
@@ -444,21 +494,27 @@ fn linear_program3(
             // hard wall lines (0..num_obstacle) are always carried into the projection set.
             proj_lines.clear();
             proj_lines.extend_from_slice(&lines[0..num_obstacle]);
+            let offset_i = lines[i].offset();
             for j in num_obstacle..i {
                 let determinant = det(lines[i].direction, lines[j].direction);
-                let point = if determinant.abs() <= EPSILON {
-                    if lines[i].direction.dot(lines[j].direction) > 0.0 {
-                        // Same direction — no new constraint.
-                        continue;
-                    }
-                    0.5 * (lines[i].point + lines[j].point)
-                } else {
-                    lines[i].point
-                        + (det(lines[j].direction, lines[i].point - lines[j].point) / determinant)
-                            * lines[i].direction
-                };
-                let direction = (lines[j].direction - lines[i].direction).normalize_or_zero();
-                proj_lines.push(Line { point, direction });
+                if determinant.abs() <= EPSILON && lines[i].direction.dot(lines[j].direction) > 0.0 {
+                    // Lines i and j are parallel and point the same way — no new constraint.
+                    continue;
+                }
+                // The projected line is where lines i and j are violated equally, along RVO2's
+                // direction `d_j - d_i`: `det(d_j - d_i, v) = offset_j - offset_i`. RVO2 anchors it at
+                // the two lines' intersection (at the midpoint of their points when they are
+                // anti-parallel), which for nearly parallel lines lies up to `1 / EPSILON` away and
+                // turns `linear_program1` into catastrophic cancellation. Built from the two offsets
+                // instead, it is the same line on the same side, anchored at its point nearest the
+                // origin. `d_j - d_i` is never zero here: equal directions are skipped above.
+                let between = lines[j].direction - lines[i].direction;
+                // RVO2 normalizes `d_j - d_i` (glam's `normalize` multiplies by the reciprocal of the
+                // length, as here); the offset is scaled by the same reciprocal.
+                let inv_length = 1.0 / between.length();
+                let direction = between * inv_length;
+                let offset = (lines[j].offset() - offset_i) * inv_length;
+                proj_lines.push(Line { point: offset * direction.perp(), direction });
             }
 
             let temp = *result;
@@ -605,6 +661,109 @@ mod tests {
         }
     }
 
+    /// An ordinary two-neighbour step the probe found on `0.2.1`: no wall, no unusual value, one
+    /// neighbour holding ground and one stepping aside, and the answer was `(2.835, -1.333)` at a
+    /// `max_speed` of 1.685 — 1.86 times the limit. The first line fails, the second is projected
+    /// onto it by `linear_program3`, and that projected line used to be anchored at the lines'
+    /// intersection, far from the speed disc.
+    #[test]
+    fn two_ordinary_neighbours_cannot_push_an_agent_over_its_speed_limit() {
+        let me = Agent {
+            pos: Vec2::new(-0.49547195, 3.4425201),
+            vel: Vec2::new(0.56427115, -0.2730432),
+            radius: 0.5298626,
+            avoids: true,
+        };
+        let holding = Agent {
+            pos: Vec2::new(-0.5121927, 4.374553),
+            vel: Vec2::new(0.7615271, 0.7948744),
+            radius: 0.54053575,
+            avoids: false,
+        };
+        let stepping_aside = Agent {
+            pos: Vec2::new(0.058371365, 1.7260351),
+            vel: Vec2::new(0.04875728, -1.309605),
+            radius: 0.48520732,
+            avoids: true,
+        };
+        let max_speed = 1.6848793_f32;
+        let v = new_velocity(
+            &me,
+            Vec2::new(-0.48186377, -1.2985785),
+            &[holding, stepping_aside],
+            &[],
+            1.0464567,
+            0.058656223,
+            max_speed,
+        );
+        let speed = f64::from(v.x).hypot(f64::from(v.y));
+        assert!(
+            speed <= f64::from(max_speed) * (1.0 + 1.0e-6),
+            "speed {speed} is {}× max_speed {max_speed}",
+            speed / f64::from(max_speed),
+        );
+    }
+
+    /// The speed disc is the one constraint every stage of the linear program is built inside, so the
+    /// answer is never faster than `max_speed`, to `f32` rounding: in a dense knot of up to twelve
+    /// neighbours, with two neighbours standing on the agent, with a row of neighbours whose
+    /// constraints are nearly parallel (`linear_program3` projects lines that meet far away), and with
+    /// an own velocity far beyond `max_speed`. Before the lines were stored at their point nearest the
+    /// origin (0.2.1), a fraction of these answers left the disc: by several times on ordinary input
+    /// and by a factor of 10⁷ from a fast own velocity.
+    #[test]
+    fn speed_bound_holds_in_dense_and_degenerate_constraint_sets() {
+        use std::f32::consts::TAU;
+        let mut scratch = OrcaScratch::default();
+        let mut seed = 0u32;
+        let mut next = || {
+            seed = seed.wrapping_add(1);
+            hash_f32(seed.wrapping_mul(0x9E37_79B1))
+        };
+        let mut neighbours = Vec::new();
+        let mut walls = Vec::new();
+        for case in 0..8_000u32 {
+            let family = case % 4;
+            let max_speed = 0.5 + 1.5 * next();
+            let own_speed =
+                if family == 3 { 10.0_f32.powf(1.0 + 14.0 * next()) } else { 1.2 * max_speed * next() };
+            let me = Agent {
+                pos: Vec2::new(10.0 * next() - 5.0, 10.0 * next() - 5.0),
+                vel: Vec2::from_angle(TAU * next()) * own_speed,
+                radius: 0.2 + 0.4 * next(),
+                avoids: true,
+            };
+            neighbours.clear();
+            for k in 0..(13.0 * next()) as usize {
+                let offset = match family {
+                    1 if k < 2 => Vec2::ZERO,
+                    2 => Vec2::new(6.0 * next() - 3.0, 0.69 + 0.02 * next()),
+                    _ => Vec2::from_angle(TAU * next()) * 3.0 * next(),
+                };
+                neighbours.push(Agent {
+                    pos: me.pos + offset,
+                    vel: Vec2::from_angle(TAU * next()) * 2.0 * next(),
+                    radius: 0.2 + 0.4 * next(),
+                    avoids: next() < 0.7,
+                });
+            }
+            walls.clear();
+            for _ in 0..(3.0 * next()) as usize {
+                walls.push((Vec2::from_angle(TAU * next()), 5.0 * next() - 1.0));
+            }
+            let pref = Vec2::from_angle(TAU * next()) * 3.0 * next();
+            let horizon = 0.5 + 2.5 * next();
+            let dt = 1.0 / 60.0 + 0.08 * next();
+            let v = new_velocity_in(&mut scratch, &me, pref, &neighbours, &walls, horizon, dt, max_speed);
+            let speed = f64::from(v.x).hypot(f64::from(v.y));
+            assert!(
+                speed <= f64::from(max_speed) * (1.0 + 1.0e-6),
+                "case {case} (family {family}): speed {speed} is {}× max_speed {max_speed}",
+                speed / f64::from(max_speed),
+            );
+        }
+    }
+
     #[test]
     fn deterministic_for_identical_input() {
         let a = agent(Vec2::new(-1.0, 0.0), Vec2::new(1.0, 0.0));
@@ -646,7 +805,9 @@ mod tests {
     #[test]
     fn degenerate_scalars_return_zero() {
         let a = agent(Vec2::ZERO, Vec2::ZERO);
-        for max_speed in [0.0_f32, -1.0, f32::NAN, f32::INFINITY, 1.0e20, f32::MAX] {
+        // A speed limit too small for its square to be a normal number is as unusable as one too
+        // large for its square to be finite: a wish of 1e-38 would pass a limit of 1e-40 unclamped.
+        for max_speed in [0.0_f32, -1.0, f32::NAN, f32::INFINITY, 1.0e20, f32::MAX, 1.0e-30, 1.0e-40] {
             let v = new_velocity(&a, Vec2::new(1.0, 0.0), &[], &[], 2.0, 1.0 / 60.0, max_speed);
             assert_eq!(v, Vec2::ZERO, "max_speed {max_speed} should give the zero velocity");
         }
