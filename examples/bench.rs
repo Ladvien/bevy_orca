@@ -60,7 +60,9 @@
 //! `ORCA_SEED=n` shifts every member's key by `n` (another crowd of the same scene, for a spread);
 //! `ORCA_SERIAL=1` times only the serial forward run, which is all a timing comparison needs, and
 //! leaves the order and thread-count hashes to a full run; `ORCA_OBST_HORIZON=s` sets
-//! `CrowdParams::obstacle_horizon` for the scenes that have obstacles.
+//! `CrowdParams::obstacle_horizon` for the scenes that have obstacles; `ORCA_LANE=f` is the share of
+//! a city street's width its walkers' four lanes spread over (default 0.6, outer lanes 0.8 m from the
+//! brick; 1.0 puts them 0.2 m from it, which squeezes head-on pairs against the wall).
 //!
 //! Run: `cargo run --release --example bench`
 
@@ -142,6 +144,13 @@ fn allocs() -> usize {
 /// unless set, so the default run is the one the hashes in the log were taken from.
 fn seed() -> u64 {
     std::env::var("ORCA_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(0)
+}
+
+/// The share of the city street's usable width the four lanes spread over (`ORCA_LANE`, `0.6` unless
+/// set): the outer lanes then keep 0.8 m clear of the brick. At `1.0` they keep 0.2 m, and a walker in
+/// such a lane meeting a head-on one has no room on its wall side to step aside.
+fn lane_share() -> f32 {
+    std::env::var("ORCA_LANE").ok().and_then(|s| s.parse().ok()).unwrap_or(0.6)
 }
 
 /// The SplitMix64 output mix: the scenes' own stable pseudo-random numbers, drawn from a member's key.
@@ -419,7 +428,7 @@ impl World {
                 let lanes = 4usize;
                 let columns = per_street.div_ceil(lanes);
                 let dx = extent / columns as f32;
-                let usable = PITCH - BLOCK - 2.0 * RADIUS - 0.4;
+                let usable = (PITCH - BLOCK - 2.0 * RADIUS - 0.4) * lane_share();
                 for (i, &key) in keys.iter().enumerate() {
                     let (street, idx) = (i % streets, i / streets);
                     let (lane, column) = (idx % lanes, idx / lanes);
