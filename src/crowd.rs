@@ -136,9 +136,9 @@ pub struct Crowd {
 #[derive(Debug, Default)]
 pub struct CrowdWorker {
     scratch: OrcaScratch,
-    /// Reused candidate buffer: `(distance, key, index)`, cut to the nearest `max_neighbours` and sorted
-    /// nearest-first before use.
-    near: Vec<(f32, u64, usize)>,
+    /// Reused candidate buffer: the heap's storage while a member is searched, and its neighbours,
+    /// nearest first, once it has been: at most `max_neighbours` of them.
+    near: Vec<Near>,
     /// Reused neighbour slice handed to the solver.
     neighbours: Vec<Agent>,
     /// Reused wall buffer, filled by the caller's `walls` closure.
@@ -231,34 +231,75 @@ fn cell_key(column: i64, row: i64) -> u64 {
     (offset(row) << 32) | offset(column)
 }
 
-/// The order candidates are kept in: distance, then the caller's key, then the member's index. Each
-/// index appears once in a candidate list, so no two candidates compare equal: the order is strict and
-/// total, and an unstable selection or sort gives the one result a stable sort would.
-fn nearest_first(a: &(f32, u64, usize), b: &(f32, u64, usize)) -> core::cmp::Ordering {
-    a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2))
+/// A candidate neighbour, ordered by distance, then the caller's key, then the member's index. The
+/// distance is held as its bits: a distance is never negative (a length), and for non-negative floats
+/// the order of the bits is `total_cmp`'s, so the derived order is that comparison made of three
+/// integer compares. Each index appears once in a candidate list, so no two candidates compare equal:
+/// the order is strict and total, and however the nearest `max_neighbours` are found they are the
+/// same ones, in the same order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct Near {
+    distance_bits: u32,
+    key: u64,
+    index: usize,
 }
 
-/// Candidate lists this short or shorter are sorted whole and cut, never selected from:
-/// `select_nth_unstable` insertion-sorts a slice of up to 16 in full anyway, so selecting first only
-/// adds a second pass (measured: about 10% dearer than one sort for 11 to 14 candidates).
-const SELECT_ABOVE: usize = 16;
+impl Near {
+    fn new(distance: f32, key: u64, index: usize) -> Self {
+        Near { distance_bits: distance.to_bits(), key, index }
+    }
 
-/// Cut `near` to its nearest `keep` candidates, in [`nearest_first`] order. A list longer than
-/// [`SELECT_ABOVE`] and than twice `keep` is first narrowed to its nearest `keep` by an in-place
-/// selection, O(candidates), so only those are sorted; selecting from a list barely longer than `keep`
-/// discards too little to pay for itself. Neither step allocates, and as no two candidates compare
-/// equal the result is the one a stable sort and a cut would give.
-fn nearest(near: &mut Vec<(f32, u64, usize)>, keep: usize) {
-    if keep == 0 {
+    fn distance(&self) -> f32 {
+        f32::from_bits(self.distance_bits)
+    }
+}
+
+/// How many candidates [`CrowdStep::gather`] holds, as a multiple of `max_neighbours`, before it cuts
+/// them to the nearest `max_neighbours`. The cut is an in-place selection over the whole buffer, so a
+/// larger buffer cuts less often but each cut costs more, and the bound it sets (what later candidates
+/// and cells are tested against) is looser for longer.
+const BUFFER: usize = 4;
+
+/// Cut `near` to its nearest `keep` candidates, in no particular order, and return the distance of the
+/// farthest of them (`None` when `near` held no more than `keep`, or `keep` is 0). The selection is
+/// in place and O(candidates); as no two candidates compare equal the kept set is the one a sort and a
+/// cut would give.
+fn cut(near: &mut Vec<Near>, keep: usize) -> Option<f32> {
+    let Some(last) = keep.checked_sub(1) else {
         near.clear();
-        return;
+        return None;
+    };
+    if near.len() <= keep {
+        return None;
     }
-    if near.len() > SELECT_ABOVE.max(keep.saturating_mul(2)) {
-        near.select_nth_unstable_by(keep, nearest_first);
-        near.truncate(keep);
-    }
-    near.sort_unstable_by(nearest_first);
+    near.select_nth_unstable(last);
     near.truncate(keep);
+    near.get(last).map(Near::distance)
+}
+
+/// The cell `(column, row)` of a grid key: [`cell_key`]'s inverse.
+fn cell_of_key(key: u64) -> (i64, i64) {
+    let coordinate = |offset: u64| offset as i64 + i64::from(i32::MIN);
+    (coordinate(key & u64::from(u32::MAX)), coordinate(key >> 32))
+}
+
+/// How far a member at `p` is at least from every point of the grid cell `(column, row)`, squared:
+/// zero inside it, and zero for a cell on the edge of the `i32` range, which holds every member beyond
+/// it. The cell's rectangle is widened by a margin that dwarfs the rounding of `floor(pos / range)`
+/// (a few ulps of the coordinates) and is far smaller than a cell, so a member that [`cell_of`] put in
+/// the cell is never nearer than this says.
+fn cell_gap_sq(p: Vec2, range: f32, column: i64, row: i64) -> f32 {
+    let edge = |cell: i64| cell <= i64::from(i32::MIN) || cell >= i64::from(i32::MAX);
+    if edge(column) || edge(row) {
+        return 0.0;
+    }
+    let margin = (p.x.abs() + p.y.abs() + range) * 1.0e-5;
+    let gap = |at: f32, cell: i64| {
+        let low = cell as f32 * range;
+        ((low - at).max(at - (low + range)) - margin).max(0.0)
+    };
+    let (gx, gy) = (gap(p.x, column), gap(p.y, row));
+    gx * gx + gy * gy
 }
 
 /// The wish [`Crowd::solve`] steers `m` by, or `None` when it leaves `m` unsolved: no
@@ -448,8 +489,7 @@ impl CrowdStep<'_> {
         mut walls: impl FnMut(usize, &mut Vec<(Vec2, f32)>),
     ) {
         let (members, params, dt) = (self.members, &self.params, self.dt);
-        let range = params.neighbour_range;
-        let search = searchable(range);
+        let search = searchable(params.neighbour_range) && params.max_neighbours > 0;
 
         for (k, slot) in out.iter_mut().enumerate() {
             *slot = None;
@@ -463,48 +503,18 @@ impl CrowdStep<'_> {
                 continue;
             };
 
-            // Neighbours: every member within `range` that this one sees, nearest first, at most
-            // `max_neighbours` of them. Ordering by `(distance, key)` is what makes the result a
-            // property of the world rather than of the input slice's order.
+            // Neighbours: the nearest `max_neighbours` members within `neighbour_range` that this one
+            // sees, nearest first. Ordering by `(distance, key)` is what makes the result a property of
+            // the world rather than of the input slice's order. The search stops at the last of them:
+            // see `gather`.
             worker.near.clear();
-            if search && let Some((cx, cy)) = cell_of(m.pos, range) {
-                // The 3×3 block around this member's cell, one row at a time: a row's three cells are
-                // one key range. Neighbouring rows and columns are taken in `i64` and kept inside the
-                // `i32` range, so a member in a saturated edge cell looks only at real cells.
-                let (lowest, highest) = (i64::from(i32::MIN), i64::from(i32::MAX));
-                let (cx, cy) = (i64::from(cx), i64::from(cy));
-                let (first_column, last_column) = ((cx - 1).max(lowest), (cx + 1).min(highest));
-                for row in (cy - 1).max(lowest)..=(cy + 1).min(highest) {
-                    let (from, to) = (cell_key(first_column, row), cell_key(last_column, row));
-                    let start = self.cells.partition_point(|&(key, _)| key < from);
-                    let end = self.cells.partition_point(|&(key, _)| key <= to);
-                    let Some(run) = self.cells.get(start..end) else {
-                        continue;
-                    };
-                    for &(_, j) in run {
-                        if j == i {
-                            continue;
-                        }
-                        let Some(other) = members.get(j) else {
-                            continue;
-                        };
-                        let dist = other.pos.distance(m.pos);
-                        if dist > range {
-                            continue;
-                        }
-                        if sees(i, j) {
-                            worker.near.push((dist, other.key, j));
-                        }
-                    }
-                }
+            if search {
+                self.gather(&mut worker.near, i, &m, &mut sees);
             }
-            // Only the nearest `max_neighbours` are used, so only they are ordered; a packed crowd
-            // offers hundreds of candidates, and a stable sort would take a heap scratch for each
-            // member above 170 of them.
-            nearest(&mut worker.near, params.max_neighbours);
 
             worker.neighbours.clear();
-            for &(_, _, j) in &worker.near {
+            for near in &worker.near {
+                let j = near.index;
                 let Some(other) = members.get(j) else {
                     continue;
                 };
@@ -556,6 +566,114 @@ impl CrowdStep<'_> {
                 dt,
                 m.max_speed,
             ));
+        }
+    }
+
+    /// Collect into `near` the `max_neighbours` members within `neighbour_range` of `m` that
+    /// `sees(i, j)` accepts, nearest first.
+    ///
+    /// The search follows the answer in. Candidates are kept in a buffer of four times
+    /// `max_neighbours`; each time it fills, an in-place selection cuts it to the nearest
+    /// `max_neighbours` and the farthest of those becomes the new `bound`. A candidate beyond the
+    /// bound cannot be among the nearest however many more there are, so it is dropped without `sees`
+    /// being asked about it, and so is every grid cell whose nearest point is beyond it: RVO2's
+    /// `rangeSq = agentNeighbors_.back().first` and its kd-tree's `if (distSqLeft < rangeSq)`, Detour's
+    /// `dist >= neis[nneis-1].dist`. The result is what offering every member in range and keeping the
+    /// nearest would give, whenever `sees` is a function of `(i, j)`; `sees` is asked about fewer
+    /// members. The member's own cell is searched first, then the rest of its row and then the nearer
+    /// of the other two rows, so the bound falls before most cells are looked at.
+    fn gather(
+        &self,
+        near: &mut Vec<Near>,
+        i: usize,
+        m: &CrowdMember,
+        sees: &mut impl FnMut(usize, usize) -> bool,
+    ) {
+        let (range, keep) = (self.params.neighbour_range, self.params.max_neighbours);
+        let Some((cx, cy)) = cell_of(m.pos, range) else {
+            return;
+        };
+        // The 3×3 block around this member's cell, one row at a time: a row's three cells are one key
+        // range. Neighbouring rows and columns are taken in `i64` and kept inside the `i32` range, so a
+        // member in a saturated edge cell looks only at real cells.
+        let (lowest, highest) = (i64::from(i32::MIN), i64::from(i32::MAX));
+        let (cx, cy) = (i64::from(cx), i64::from(cy));
+        let (first_column, last_column) = ((cx - 1).max(lowest), (cx + 1).min(highest));
+        let toward = if m.pos.y - cy as f32 * range < (cy + 1) as f32 * range - m.pos.y { -1 } else { 1 };
+        // How far out a candidate may be: the range, and then the farthest of the nearest found.
+        let mut bound = range;
+        for row in [cy, cy + toward, cy - toward] {
+            if row < lowest
+                || row > highest
+                || (row != cy && cell_gap_sq(m.pos, range, cx, row) > bound * bound)
+            {
+                continue;
+            }
+            let (from, to) = (cell_key(first_column, row), cell_key(last_column, row));
+            let start = self.cells.partition_point(|&(key, _)| key < from);
+            let end = self.cells.partition_point(|&(key, _)| key <= to);
+            let Some(run) = self.cells.get(start..end) else {
+                continue;
+            };
+            if row != cy {
+                self.scan(run, i, m, &mut bound, near, sees);
+                continue;
+            }
+            // The member's own cell is the run's middle: its members are the likeliest to be nearest.
+            let own = cell_key(cx, cy);
+            let before = run.partition_point(|&(key, _)| key < own);
+            let Some((left, rest)) = run.split_at_checked(before) else {
+                continue;
+            };
+            let Some((mine, right)) = rest.split_at_checked(rest.partition_point(|&(key, _)| key == own))
+            else {
+                continue;
+            };
+            for part in [mine, left, right] {
+                self.scan(part, i, m, &mut bound, near, sees);
+            }
+        }
+        cut(near, keep);
+        near.sort_unstable();
+    }
+
+    /// Offer `near` the members of `run`, a stretch of the grid sorted by cell, that are within `bound`
+    /// of `m` and that `sees(i, j)` accepts; whole cells beyond `bound` are passed over. Each time
+    /// `near` fills its buffer it is cut to the nearest `max_neighbours` and `bound` falls to the
+    /// farthest of them.
+    fn scan(
+        &self,
+        run: &[(u64, usize)],
+        i: usize,
+        m: &CrowdMember,
+        bound: &mut f32,
+        near: &mut Vec<Near>,
+        sees: &mut impl FnMut(usize, usize) -> bool,
+    ) {
+        let (range, keep) = (self.params.neighbour_range, self.params.max_neighbours);
+        let buffer = keep.saturating_mul(BUFFER);
+        // A run is sorted by cell, so the cell is decided when its key changes.
+        let (mut cell, mut skip) = (None, false);
+        for &(key, j) in run {
+            if cell != Some(key) {
+                cell = Some(key);
+                let (column, row) = cell_of_key(key);
+                skip = cell_gap_sq(m.pos, range, column, row) > *bound * *bound;
+            }
+            if skip || j == i {
+                continue;
+            }
+            let Some(other) = self.members.get(j) else {
+                continue;
+            };
+            let distance = other.pos.distance(m.pos);
+            if distance > *bound || !sees(i, j) {
+                continue;
+            }
+            near.push(Near::new(distance, other.key, j));
+            if near.len() >= buffer {
+                *bound = cut(near, keep).unwrap_or(*bound);
+            }
         }
     }
 }
@@ -1017,6 +1135,115 @@ mod tests {
                     Some((want.x.to_bits(), want.y.to_bits())),
                     "member {i} with max_neighbours {max_neighbours}: {:?} vs {want}",
                     solved[i]
+                );
+            }
+        }
+    }
+
+    /// The neighbours a member is given are exactly the nearest `max_neighbours` of the members in range
+    /// that `sees` accepts, nearest first, however the crowd is laid out: on a lattice whose spacing puts
+    /// members on the grid's cell edges, coincident (so that distance ties fall to the key and then the
+    /// index, with duplicate keys), and beside members whose state is unusable or whose position is at the
+    /// edge of the float range. And `sees` is asked about a member at most once, only about members
+    /// in range, and about every member that was kept. The reference is a brute-force scan of every
+    /// member. Any change to which cells are looked at, or to when a candidate is dropped, has to keep
+    /// all of it.
+    #[test]
+    fn the_search_finds_the_nearest_whatever_the_layout() {
+        let draw = |counter: &mut u64| {
+            *counter += 1;
+            splitmix64(*counter)
+        };
+        let unit = |counter: &mut u64| (draw(counter) >> 40) as f32 / (1u64 << 24) as f32;
+        let mut counter = 0xC0FF_EE00u64;
+        for case in 0..600 {
+            let n = 1 + (draw(&mut counter) % 90) as usize;
+            let range = [1.0e-3, 0.05, 0.5, 1.0, 3.0, 7.5, 1.0e4][(draw(&mut counter) % 7) as usize];
+            let keep = [1usize, 2, 3, 7, 10, 16, 40, 1_000, usize::MAX][(draw(&mut counter) % 9) as usize];
+            let layout = draw(&mut counter) % 4;
+            let distinct_keys = 1 + draw(&mut counter) % (n as u64 + 1);
+            let salt = draw(&mut counter);
+            let members: Vec<CrowdMember> = (0..n)
+                .map(|i| {
+                    let pos = match layout {
+                        // A lattice whose pitch is half the range: every member on a cell edge or a corner.
+                        0 => Vec2::new((i % 9) as f32, (i / 9) as f32) * (range * 0.5) - Vec2::splat(range),
+                        // Scattered over a block three cells wide.
+                        1 => Vec2::new(unit(&mut counter), unit(&mut counter)) * range * 3.0,
+                        // A handful of distinct points, so many members coincide.
+                        2 => {
+                            Vec2::new((draw(&mut counter) % 4) as f32, (draw(&mut counter) % 3) as f32)
+                                * range
+                        }
+                        // Scattered, with a few members out where a cell index saturates.
+                        _ => match draw(&mut counter) % 12 {
+                            0 => Vec2::new(1.0e30, -1.0e30),
+                            1 => Vec2::new(f32::MAX, 0.0),
+                            2 => Vec2::new(f32::NAN, 0.0),
+                            3 => Vec2::new(0.0, f32::INFINITY),
+                            _ => Vec2::new(unit(&mut counter), unit(&mut counter)) * range * 2.0,
+                        },
+                    };
+                    let mut m = member(draw(&mut counter) % distinct_keys, pos, Vec2::ZERO, Some(Vec2::X));
+                    // Some members have no usable state, so the grid leaves them out.
+                    match draw(&mut counter) % 16 {
+                        0 => m.vel = Vec2::new(f32::NAN, 0.0),
+                        1 => m.radius = -1.0,
+                        _ => {}
+                    }
+                    m
+                })
+                .collect();
+            let params = CrowdParams { max_neighbours: keep, ..CrowdParams::new(range) };
+            let mut crowd = Crowd::default();
+            let step = crowd.begin(&members, &params, 1.0 / 60.0);
+            let accepts = |i: usize, j: usize| splitmix64((i as u64) << 32 ^ j as u64 ^ salt) % 4 != 0;
+            for (i, m) in members.iter().enumerate() {
+                let mut asked = Vec::new();
+                let mut near = Vec::new();
+                step.gather(&mut near, i, m, &mut |a, b| {
+                    asked.push(b);
+                    accepts(a, b)
+                });
+                let in_range: Vec<usize> = members
+                    .iter()
+                    .enumerate()
+                    .filter(|&(j, o)| {
+                        j != i && usable_state(o.pos, o.vel, o.radius) && o.pos.distance(m.pos) <= range
+                    })
+                    .map(|(j, _)| j)
+                    .collect();
+                let mut want: Vec<(u32, u64, usize)> = in_range
+                    .iter()
+                    .filter(|&&j| accepts(i, j))
+                    .map(|&j| (members[j].pos.distance(m.pos).to_bits(), members[j].key, j))
+                    .collect();
+                want.sort_by(|a, b| {
+                    f32::from_bits(a.0)
+                        .total_cmp(&f32::from_bits(b.0))
+                        .then(a.1.cmp(&b.1))
+                        .then(a.2.cmp(&b.2))
+                });
+                want.truncate(keep);
+                let got: Vec<(u32, u64, usize)> =
+                    near.iter().map(|n| (n.distance_bits, n.key, n.index)).collect();
+                assert_eq!(got, want, "case {case}, member {i}: range {range}, keep {keep}, layout {layout}");
+
+                let mut sorted = asked.clone();
+                sorted.sort_unstable();
+                sorted.dedup();
+                assert_eq!(
+                    sorted.len(),
+                    asked.len(),
+                    "case {case}, member {i}: `sees` asked twice about one member"
+                );
+                assert!(
+                    asked.iter().all(|j| in_range.contains(j)),
+                    "case {case}, member {i}: `sees` asked about a member out of range"
+                );
+                assert!(
+                    want.iter().all(|&(_, _, j)| asked.contains(&j)),
+                    "case {case}, member {i}: a kept member was never put to `sees`"
                 );
             }
         }
