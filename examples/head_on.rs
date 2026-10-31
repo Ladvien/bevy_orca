@@ -1,6 +1,6 @@
 //! **Reciprocity, and the one case it cannot resolve for you.**
 //!
-//! Three passes over the same scene, each printing how far to the side either agent stepped.
+//! Four passes over the same scene, each printing how far to the side either agent stepped.
 //!
 //! 1. **Exactly collinear.** Both agents ask to walk straight through each other along the same line.
 //!    The linear program is perfectly symmetric, so there is no reason to prefer left over right: both
@@ -13,6 +13,11 @@
 //!    approaches are measure-zero once anything in your game moves.
 //! 3. **The neighbour holds ground** (`avoids: false`). The mover takes the *full* avoidance instead
 //!    of assuming an idle unit will step aside and then walking through it.
+//! 4. **One has the right of way** (`Agent::priority`, 3 against 1). Both still step aside, but A takes a
+//!    quarter of each step's dodge and B three quarters, where case 2 gave each a half. The more B moves
+//!    the less is left for A to do, so A ends up sidestepping a small fraction of what B does, while the
+//!    pair as a whole steps aside about as far as two equal agents: the one that matters more to the
+//!    player gives way less.
 //!
 //! Run: `cargo run -p bevy_orca --example head_on`
 
@@ -33,14 +38,27 @@ struct Outcome {
 }
 
 /// Walk the pair toward each other's start position. `offset` displaces them laterally to break the
-/// symmetry; `b_avoids` is whether the neighbour is running avoidance too.
+/// symmetry; `b_avoids` is whether the neighbour is running avoidance too; `priorities` are their
+/// right of way, A's then B's.
 ///
 /// When `b_avoids` is false, B is a genuinely idle unit: it neither avoids **nor moves**. That is the
 /// situation the flag exists to describe, and solving for B anyway would quietly make it a cooperating
 /// agent that merely claimed not to be.
-fn run(offset: f32, b_avoids: bool, label: &str) -> Outcome {
-    let mut a = Agent { pos: Vec2::new(-4.0, offset), vel: Vec2::ZERO, radius: RADIUS, avoids: true };
-    let mut b = Agent { pos: Vec2::new(4.0, -offset), vel: Vec2::ZERO, radius: RADIUS, avoids: b_avoids };
+fn run(offset: f32, b_avoids: bool, priorities: (f32, f32), label: &str) -> Outcome {
+    let mut a = Agent {
+        pos: Vec2::new(-4.0, offset),
+        vel: Vec2::ZERO,
+        radius: RADIUS,
+        avoids: true,
+        priority: priorities.0,
+    };
+    let mut b = Agent {
+        pos: Vec2::new(4.0, -offset),
+        vel: Vec2::ZERO,
+        radius: RADIUS,
+        avoids: b_avoids,
+        priority: priorities.1,
+    };
 
     let (goal_a, goal_b) = (Vec2::new(4.0, offset), Vec2::new(-4.0, -offset));
     let (mut peak_a, mut peak_b) = (0.0f32, 0.0f32);
@@ -95,14 +113,14 @@ fn report(o: &Outcome) {
 }
 
 fn main() {
-    let tied = run(0.0, true, "1. exactly collinear — the degenerate tie");
+    let tied = run(0.0, true, (1.0, 1.0), "1. exactly collinear — the degenerate tie");
     report(&tied);
     println!(
         "  Neither stepped aside, and they stalled at a standoff rather than colliding. The\n\
          constraint was satisfied; there was simply no asymmetry to resolve it in either direction."
     );
 
-    let split = run(0.05, true, "2. 5 cm of offset — reciprocity resolves it");
+    let split = run(0.05, true, (1.0, 1.0), "2. 5 cm of offset — reciprocity resolves it");
     report(&split);
     if split.peak_b > 1.0e-4 {
         println!(
@@ -112,7 +130,7 @@ fn main() {
         );
     }
 
-    let uneven = run(0.05, false, "3. B holds ground (avoids: false)");
+    let uneven = run(0.05, false, (1.0, 1.0), "3. B holds ground (avoids: false)");
     report(&uneven);
     if split.peak_a > 1.0e-4 {
         println!(
@@ -125,4 +143,17 @@ fn main() {
         "  A also did not get *past* B here, and that is not a failure: ORCA is local avoidance, not\n\
          path planning. It keeps you off the obstacle; routing around one is your navigator's job."
     );
+
+    let right_of_way = run(0.05, true, (3.0, 1.0), "4. A has right of way (priority 3 against 1)");
+    report(&right_of_way);
+    if right_of_way.peak_b > 1.0e-4 {
+        println!(
+            "  ratio A/B = {:.2}: A takes a quarter of each step's dodge and B three quarters (`other / (this + other)`),\n\
+             and the more B moves the less is left for A, so A sidesteps a small fraction of B's. Together they step\n\
+             aside {:.3} against {:.3} for two equal agents: the pair dodges as much, and who does it has changed.",
+            right_of_way.peak_a / right_of_way.peak_b,
+            right_of_way.peak_a + right_of_way.peak_b,
+            split.peak_a + split.peak_b
+        );
+    }
 }
