@@ -41,6 +41,28 @@
 //! spawn or a teleport into a building is the host's to repair, as final contact always is (see the
 //! crate docs). An agent whose disc touches an edge from outside may not approach it at all, and
 //! may slide along or leave.
+//!
+//! # Example
+//!
+//! ```
+//! use bevy_math::Vec2;
+//! use bevy_orca::{Agent, ObstaclesBuilder, OrcaScratch, new_velocity_in};
+//!
+//! // A building 8 m wide and 4 m deep, and an agent 1 m from its face, running straight at it.
+//! let mut builder = ObstaclesBuilder::new();
+//! builder.add_box(Vec2::ZERO, Vec2::new(4.0, 2.0)).expect("a box");
+//! let obstacles = builder.build().expect("one box");
+//!
+//! let agent = Agent { pos: Vec2::new(0.0, -3.0), vel: Vec2::Y, radius: 0.3, avoids: true };
+//! let mut scratch = OrcaScratch::default();
+//! let mut walls = Vec::new();
+//! // Half a second of look-ahead against obstacles, at a top speed of 1.5: the hard lines, in the
+//! // form `new_velocity_in` takes its `walls`.
+//! obstacles.push_walls(&mut scratch, &agent, 1.5, 0.5, &mut walls);
+//! let v = new_velocity_in(&mut scratch, &agent, Vec2::Y * 1.5, &[], &walls, 2.0, 1.0 / 60.0, 1.5);
+//! // It may still close on the face, but only as fast as the gap allows: (1 - 0.3) / 0.5 = 1.4.
+//! assert!((v.y - 1.4).abs() < 1.0e-4 && v.x.abs() < 1.0e-4);
+//! ```
 
 use bevy_math::Vec2;
 
@@ -648,18 +670,21 @@ impl Lattice {
     fn cells_of(&self, a: Vec2, b: Vec2, mut f: impl FnMut(usize)) {
         let (ga, gb) = ((a - self.origin) * self.inv_cell, (b - self.origin) * self.inv_cell);
         let (x0, x1) = (ga.x.min(gb.x), ga.x.max(gb.x));
-        let slope = if gb.x == ga.x { 0.0 } else { (gb.y - ga.y) / (gb.x - ga.x) };
+        // Infinite (or, for an edge that is a hair off vertical, too steep to hold) when vertical: then
+        // its rows are simply those of its two ends.
+        let slope = (gb.y - ga.y) / (gb.x - ga.x);
+        let vertical = !slope.is_finite();
         let first = ((x0 - CELL_PAD).floor().max(0.0) as usize).min(self.columns.saturating_sub(1));
         let last = ((x1 + CELL_PAD).floor().max(0.0) as usize).min(self.columns.saturating_sub(1));
         for column in first..=last {
             // Where the edge is, in y, over the part of it that lies in this column.
             let (lo_x, hi_x) = ((column as f32).max(x0), ((column + 1) as f32).min(x1));
-            let (mut y0, mut y1) = if gb.x == ga.x {
+            let (mut y0, mut y1) = if vertical {
                 (ga.y.min(gb.y), ga.y.max(gb.y))
             } else {
                 let at = |x: f32| ga.y + slope * (x - ga.x);
                 let (p, q) = (at(lo_x.min(hi_x)), at(hi_x.max(lo_x)));
-                (p.min(q), p.max(q))
+                if p.is_nan() || q.is_nan() { (ga.y.min(gb.y), ga.y.max(gb.y)) } else { (p.min(q), p.max(q)) }
             };
             y0 -= CELL_PAD;
             y1 += CELL_PAD;
@@ -1164,5 +1189,20 @@ mod tests {
         }
         // The comparison is not vacuous: agents did see edges.
         assert!(produced > 1000, "only {produced} lines in 8 000 queries");
+    }
+
+    /// A wall that is a hair off vertical (its ends differ in `x` by a subnormal) has a slope too steep
+    /// for an `f32`, `inf · 0` is a NaN, and the grid then linked it into one row only: a walker beside
+    /// the rest of its length was handed no line at all. It is linked along its whole length.
+    #[test]
+    fn a_wall_a_hair_off_vertical_is_found_along_its_length() {
+        let hair = 1.0e-39; // a subnormal
+        let obstacles = built(|b| {
+            b.add_wall(v(0.0, 0.0), v(hair, 100.0))?.add_wall(v(30.0, 0.0), v(30.0, 100.0))?.add_wall(v(60.0, 10.0), v(90.0, 10.0))
+        });
+        for y in [0.5, 3.0, 25.0, 50.0, 75.0, 97.0, 99.5] {
+            let (walls, _) = solve(&obstacles, v(0.5, y), Vec2::ZERO, v(-1.5, 0.0), 2.0);
+            assert!(!walls.is_empty(), "no line for a walker 0.5 m beside the wall at y = {y}");
+        }
     }
 }
