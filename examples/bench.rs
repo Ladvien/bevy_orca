@@ -35,12 +35,19 @@
 //! After each scene, `scaling_1k_10k` is the exponent of the median step from 1 000 to 10 000 agents
 //! at constant density: 1.0 is linear.
 //!
-//! A second section, `arrive`, runs the circle swap at 20, 100 and 1 000 agents and a 2×50 two-way
-//! corridor for three times the longest straight-line time, and prints the fraction that arrived and
-//! how many stalled (under 5% of their preferred speed for more than 2 s, away from their goal).
+//! A second section, `arrive`, runs the circle swap at 20, 100 and 1 000 agents (1 m of ring per agent)
+//! and at 20 agents on the `circle_swap` example's wider ring, a 100-agent two-way corridor, and the
+//! bottleneck at 100, 200 and 400 agents, each for three times the longest straight-line time. It prints
+//! the fraction that arrived (in the bottleneck, that got through the gap), how many stalled (under 5%
+//! of their preferred speed for more than 2 s, away from their goal), and `t50_s` / `t90_s`, when half
+//! and nine tenths had arrived. The 20 agents on the 1 m ring never arrive: that ring is the tightest
+//! their discs fit, a fixed point of the solver no sideways kick leaves (see the README's known limits).
 //!
-//! Knobs: `ORCA_SCENES=open,circle` and `ORCA_SIZES=100,1000` restrict the timing section;
-//! `ORCA_ARRIVE=0` skips the arrival section, `ORCA_ARRIVE=only` runs nothing else.
+//! Knobs: `ORCA_SCENES=open,circle` restricts both sections to those scenes and `ORCA_SIZES=100,1000`
+//! the timing one; `ORCA_ARRIVE=0` skips the arrival section, `ORCA_ARRIVE=only` runs nothing else;
+//! `ORCA_SEED=n` shifts every member's key by `n` (another crowd of the same scene, for a spread);
+//! `ORCA_SERIAL=1` times only the serial forward run, which is all a timing comparison needs, and
+//! leaves the order and thread-count hashes to a full run.
 //!
 //! Run: `cargo run --release --example bench`
 
@@ -109,7 +116,13 @@ fn allocs() -> usize {
 // Deterministic hashing: the bench's own randomness is a function of an agent's key, never of a
 // shared stream, so member order cannot change a goal.
 
-/// The SplitMix64 output mix — the same function `Crowd` hashes a key with to pick its nudge side.
+/// `ORCA_SEED`, added to every member's key: a different crowd of the same scene, for a spread. Zero
+/// unless set, so the default run is the one the hashes in the log were taken from.
+fn seed() -> u64 {
+    std::env::var("ORCA_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(0)
+}
+
+/// The SplitMix64 output mix: the scenes' own stable pseudo-random numbers, drawn from a member's key.
 fn splitmix64(mut x: u64) -> u64 {
     x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
     let mut z = x;
@@ -206,9 +219,15 @@ struct World {
 
 impl World {
     fn new(scene: Scene, n: usize) -> Self {
+        Self::with_ring(scene, n, 1.0)
+    }
+
+    /// `scene`, with the circle swap's ring `metres_per_agent` of circumference per agent (the other
+    /// scenes ignore it).
+    fn with_ring(scene: Scene, n: usize, metres_per_agent: f32) -> Self {
         let mut pos = Vec::with_capacity(n);
         let mut goal = Vec::with_capacity(n);
-        let keys: Vec<u64> = (0..n as u64).collect();
+        let keys: Vec<u64> = (0..n as u64).map(|k| k + seed()).collect();
         let mut extent = 0.0;
         let mut segments = Vec::new();
         match scene {
@@ -226,7 +245,7 @@ impl World {
                 }
             }
             Scene::Circle => {
-                let ring = n as f32 / std::f32::consts::TAU;
+                let ring = n as f32 * metres_per_agent / std::f32::consts::TAU;
                 for i in 0..n {
                     let angle = i as f32 * std::f32::consts::TAU / n as f32;
                     let p = Vec2::new(angle.cos(), angle.sin()) * ring;
@@ -428,8 +447,8 @@ impl World {
 
 // ---------------------------------------------------------------------------------------------
 // The caller's parallel ring, until the crate offers one: the same neighbour rule `Crowd` applies
-// (members within range, sorted by distance then key, at most `max_neighbours`, nudged to the side
-// hashed from the key), solved with `new_velocity_in` on scoped worker threads.
+// (members within range, sorted by distance then key, at most `max_neighbours`, kicked toward the
+// right of the wish), solved with `new_velocity_in` on scoped worker threads.
 
 /// A uniform grid of member indices, cell = range.
 #[derive(Default)]
@@ -541,12 +560,7 @@ fn solve_parallel(
                             avoids: other.pref_vel.is_some(),
                         });
                     }
-                    let wish = if w.near.is_empty() {
-                        pref
-                    } else {
-                        let side = if splitmix64(m.key) & 1 == 0 { 1.0 } else { -1.0 };
-                        pref + pref.perp() * (params.nudge * side)
-                    };
+                    let wish = if w.near.is_empty() { pref } else { pref - pref.perp() * params.nudge };
                     w.walls.clear();
                     world.walls(m.pos, &mut w.walls);
                     let me = Agent { pos: m.pos, vel: m.vel, radius: m.radius, avoids: true };
@@ -691,16 +705,21 @@ fn line(scene: Scene, n: usize, threads: usize, reversed: bool, o: &Outcome, mea
 }
 
 /// The arrival check: solve `scene` with `Crowd` for three times the longest straight-line time.
-fn arrive(scene: Scene, n: usize) {
+/// `metres_per_agent` is the circle swap's ring per agent. `t50_s` and `t90_s` are when half and nine
+/// tenths of the agents had arrived, or `never`: a crowd that gets through slowly and one that gets
+/// through fast both read `arrived=1.000` otherwise, and in the bottleneck `arrived` is the flow
+/// through the gap within the budget.
+fn arrive(scene: Scene, n: usize, metres_per_agent: f32) {
     let params = CrowdParams::new(RANGE);
-    let mut world = World::new(scene, n);
+    let mut world = World::with_ring(scene, n, metres_per_agent);
     let longest = (0..n).map(|a| world.pos[a].distance(world.goal[a])).fold(0.0, f32::max);
     let steps = (3.0 * longest / SPEED / DT).ceil() as usize;
     let mut crowd = Crowd::default();
     let (mut members, mut slots, mut out) = (Vec::new(), Vec::new(), Vec::new());
     let mut check_grid = Grid::default();
     let (mut overlap_max, mut wall_max) = (0.0f32, 0.0f32);
-    for _ in 0..steps {
+    let (mut t50, mut t90) = (None, None);
+    for step in 0..steps {
         world.members(false, &mut members, &mut slots);
         if members.is_empty() {
             break;
@@ -716,12 +735,26 @@ fn arrive(scene: Scene, n: usize) {
                 wall_max = wall_max.max(world.wall_depth(a));
             }
         }
+        let through = world.gone.iter().filter(|g| **g).count();
+        if t50.is_none() && through * 2 >= n {
+            t50 = Some((step + 1) as f32 * DT);
+        }
+        if t90.is_none() && through * 10 >= n * 9 {
+            t90 = Some((step + 1) as f32 * DT);
+        }
     }
     let arrived = world.gone.iter().filter(|g| **g).count();
     let stalled = world.stalled.iter().filter(|s| **s).count();
+    let seconds = |t: Option<f32>| t.map_or_else(|| "never".to_string(), |t| format!("{t:.1}"));
+    let (t50, t90) = (seconds(t50), seconds(t90));
+    let ring = if scene == Scene::Circle && metres_per_agent != 1.0 {
+        format!(" ring_m_per_agent={metres_per_agent}")
+    } else {
+        String::new()
+    };
     println!(
         "orca: arrive {} agents={n} steps={steps} arrived={:.3} stalled={stalled} overlap_max={:.4} wall_max={:.4} \
-         hash={:016x}",
+         hash={:016x} t50_s={t50} t90_s={t90}{ring}",
         scene.name(),
         arrived as f64 / n as f64,
         overlap_max,
@@ -743,6 +776,7 @@ fn main() {
     };
     let arrive_mode = std::env::var("ORCA_ARRIVE").unwrap_or_default();
     let threads_default = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let serial_only = std::env::var("ORCA_SERIAL").is_ok();
 
     if arrive_mode != "only" {
         for &scene in &scenes {
@@ -751,6 +785,9 @@ fn main() {
                 let serial = run(scene, n, 0, false, true);
                 line(scene, n, 1, false, &serial, true);
                 medians.push((n, serial.median_us));
+                if serial_only {
+                    continue;
+                }
                 let rev = run(scene, n, 0, true, false);
                 line(scene, n, 1, true, &rev, false);
                 let mut thread_counts = vec![2];
@@ -770,9 +807,22 @@ fn main() {
     }
 
     if arrive_mode != "0" {
-        for n in [20, 100, 1_000] {
-            arrive(Scene::Circle, n);
+        let wanted = |scene: Scene| scenes.contains(&scene);
+        if wanted(Scene::Circle) {
+            for n in [20, 100, 1_000] {
+                arrive(Scene::Circle, n, 1.0);
+            }
+            // The same 20 agents on a ring the `circle_swap` example's size (6 m of radius, 1.9 m of
+            // ring each), which is not the tight ring of the first row: see the README's known limits.
+            arrive(Scene::Circle, 20, 6.0 * std::f32::consts::TAU / 20.0);
         }
-        arrive(Scene::Corridor, 100);
+        if wanted(Scene::Corridor) {
+            arrive(Scene::Corridor, 100, 1.0);
+        }
+        if wanted(Scene::Bottleneck) {
+            for n in [100, 200, 400] {
+                arrive(Scene::Bottleneck, n, 1.0);
+            }
+        }
     }
 }

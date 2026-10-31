@@ -20,9 +20,9 @@ use crate::{Agent, OrcaScratch, new_velocity_in, usable_speed, usable_state};
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect))]
 pub struct CrowdMember {
-    /// The caller's stable id for this member. It breaks a tie between two equidistant neighbours and
-    /// picks which side of an exact head-on meeting this member steps to, so an identical world solves
-    /// identically however the members are ordered in the input slice.
+    /// The caller's stable id for this member. It breaks a tie between two equidistant neighbours, so an
+    /// identical world solves identically however the members are ordered in the input slice. It has no
+    /// part in which side a member passes on: that is [`CrowdParams::nudge`]'s, the same for everyone.
     pub key: u64,
     /// Position on the ground plane.
     pub pos: Vec2,
@@ -60,8 +60,13 @@ pub struct CrowdParams {
     pub max_neighbours: usize,
     /// Sideways kick, as a fraction of the wish, applied when a member has any neighbour at all. It
     /// breaks the exact symmetry of a head-on meeting, which the linear program has no reason to
-    /// prefer either way and will otherwise stall. A kick the wish cannot take — the nudged wish
-    /// is not finite, as for a wish near `f32::MAX`, or `nudge` is NaN — is not applied.
+    /// prefer either way and will otherwise stall, and it is **one side for the whole crowd**: a
+    /// positive value kicks every member toward the right of its own wish (clockwise in the plane the
+    /// members are given in, the side ORCA's own tie-break passes on), a negative one toward the left.
+    /// Two members that meet head-on are then kicked past each other, and a crowd in motion sorts
+    /// itself into one stream per direction instead of leaving half its head-on pairs unbroken. A kick
+    /// the wish cannot take — the kicked wish is not finite, as for a wish near `f32::MAX`, or `nudge`
+    /// is NaN — is not applied.
     pub nudge: f32,
 }
 
@@ -147,16 +152,6 @@ fn nearest(near: &mut Vec<(f32, u64, usize)>, keep: usize) {
     }
     near.sort_unstable_by(nearest_first);
     near.truncate(keep);
-}
-
-/// The SplitMix64 output mix. A stable hash of the caller's key, so the side a head-on member steps to
-/// is a property of that member and not of the tick.
-fn splitmix64(mut x: u64) -> u64 {
-    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    let mut z = x;
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^ (z >> 31)
 }
 
 /// The wish [`Crowd::solve`] steers `m` by, or `None` when it leaves `m` unsolved: no
@@ -289,16 +284,16 @@ impl Crowd {
                 });
             }
 
-            // The wish, nudged sideways when anyone is near. The side is the member's own, hashed from
-            // its key, so two agents meeting head-on do not both pick the same side. A nudge the wish
-            // cannot take — the sum is not finite, as for a wish near `f32::MAX` — is not applied: such
-            // a wish is a direction already, and `new_velocity_in` would refuse the non-finite sum.
+            // The wish, kicked toward the right of its own direction when anyone is near: the same side
+            // for every member, so two agents meeting head-on are kicked past each other and a stream
+            // keeps to one side. A kick the wish cannot take — the sum is not finite, as for a wish near
+            // `f32::MAX` — is not applied: such a wish is a direction already, and `new_velocity_in`
+            // would refuse the non-finite sum.
             let wish = if self.near.is_empty() {
                 pref
             } else {
-                let side = if splitmix64(m.key) & 1 == 0 { 1.0 } else { -1.0 };
-                let nudged = pref + pref.perp() * (params.nudge * side);
-                if nudged.is_finite() { nudged } else { pref }
+                let kicked = pref - pref.perp() * params.nudge;
+                if kicked.is_finite() { kicked } else { pref }
             };
 
             self.walls.clear();
@@ -328,6 +323,15 @@ mod tests {
 
     fn member(key: u64, pos: Vec2, vel: Vec2, pref: Option<Vec2>) -> CrowdMember {
         CrowdMember { key, pos, vel, radius: 0.5, max_speed: 1.5, pref_vel: pref }
+    }
+
+    /// The SplitMix64 output mix: the tests' own stable pseudo-random numbers.
+    fn splitmix64(mut x: u64) -> u64 {
+        x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = x;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
     }
 
     /// Two members walking at each other must not pass through one another: reciprocity divides the
@@ -360,6 +364,176 @@ mod tests {
             min_gap >= sum_radii - 0.05,
             "members closed to {min_gap}, inside the {sum_radii} summed radii"
         );
+    }
+
+    /// The kick is one side for the whole crowd, whatever the keys. A lone member with a neighbour
+    /// behind it, which constrains nothing, answers exactly `wish − perp(wish)·nudge`: toward its right
+    /// for a positive `nudge`, its left for a negative one, and the same for every key. (The kick used
+    /// to take a side from a hash of the key, so half of these keys were kicked the other way.)
+    #[test]
+    fn every_member_is_kicked_to_the_same_side_whatever_its_key() {
+        let mut crowd = Crowd::default();
+        let wish = Vec2::new(1.0, 0.0);
+        for nudge in [0.05, -0.05, 0.2] {
+            let params = CrowdParams { nudge, ..CrowdParams::new(4.0) };
+            for key in 0..64 {
+                let mover = member(key, Vec2::ZERO, Vec2::ZERO, Some(wish));
+                let behind = member(key + 1000, Vec2::new(-3.0, 0.0), Vec2::ZERO, None);
+                let members = [mover, behind];
+                let solved = crowd.solve(&members, &params, 1.0 / 60.0, |_, _| true, |_, b| b.clear());
+                let v = solved[0].expect("the mover is solved");
+                assert_eq!(v, Vec2::new(1.0, -nudge), "key {key}, nudge {nudge}");
+            }
+        }
+    }
+
+    /// Two members walking straight at each other sidestep by the same amount, whichever keys they
+    /// carry: the pair is reciprocal, as a 180° turn of the whole scene is the same scene. With a side
+    /// drawn per key, exactly the key pairs whose draws differed — half of them — were kicked toward
+    /// the same side of the line, and one of the two sidestepped up to a fifth further than the other.
+    /// A positive `nudge` agrees with where ORCA's own tie-break sends an exactly collinear pair, each
+    /// to its own right.
+    #[test]
+    fn a_head_on_pair_sidesteps_equally_whatever_its_keys() {
+        let dt = 1.0 / 60.0;
+        let mut crowd = Crowd::default();
+        for nudge in [0.05, -0.05] {
+            let params = CrowdParams { nudge, ..CrowdParams::new(4.0) };
+            for key_a in 0..8 {
+                for key_b in 0..8 {
+                    let mut a = member(key_a, Vec2::new(-4.0, 0.0), Vec2::ZERO, Some(Vec2::X));
+                    let mut b = member(key_b, Vec2::new(4.0, 0.0), Vec2::ZERO, Some(-Vec2::X));
+                    let (mut peak_a, mut peak_b) = (0.0f32, 0.0f32);
+                    for _ in 0..480 {
+                        let members = [a, b];
+                        let solved = crowd.solve(&members, &params, dt, |_, _| true, |_, buf| buf.clear());
+                        a.vel = solved[0].expect("solved");
+                        b.vel = solved[1].expect("solved");
+                        a.pos += a.vel * dt;
+                        b.pos += b.vel * dt;
+                        if a.pos.y.abs() > peak_a.abs() {
+                            peak_a = a.pos.y;
+                        }
+                        if b.pos.y.abs() > peak_b.abs() {
+                            peak_b = b.pos.y;
+                        }
+                    }
+                    let at =
+                        format!("keys ({key_a}, {key_b}), nudge {nudge}: sidesteps {peak_a} and {peak_b}");
+                    assert!(peak_a.abs() > 0.1, "{at}: the pair did not sidestep");
+                    assert!((peak_a + peak_b).abs() < 0.01 * peak_a.abs(), "{at}: not equal and opposite");
+                    assert!(a.pos.x > 3.5 && b.pos.x < -3.5, "{at}: the pair did not get past each other");
+                    if nudge > 0.0 {
+                        // `a` heads along +x, whose right is −y; `b` heads along −x, whose right is +y.
+                        assert!(peak_a < 0.0 && peak_b > 0.0, "{at}: not each to its own right");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The result of one circle swap: how many agents arrived, how many ever stopped for over two
+    /// seconds on the way, and how many of the agent-steps spent between a tenth and half of the ring's
+    /// radius from the centre, moving, were turning counter-clockwise rather than clockwise.
+    struct Swap {
+        arrived: usize,
+        stalled: usize,
+        turning_ccw: usize,
+        turning_cw: usize,
+    }
+
+    /// `n` agents of radius 0.3 at 1 m of ring each, every one walking to the point opposite its own,
+    /// at 1.3 m/s, stepped for three times the straight-line time with `Crowd`'s defaults but `nudge`.
+    fn circle_swap(n: usize, nudge: f32) -> Swap {
+        let (radius, speed, dt) = (0.3f32, 1.3f32, 1.0 / 30.0);
+        let ring = n as f32 / core::f32::consts::TAU;
+        let angle = |i: usize| i as f32 * core::f32::consts::TAU / n as f32;
+        let mut pos: Vec<Vec2> = (0..n).map(|i| Vec2::new(angle(i).cos(), angle(i).sin()) * ring).collect();
+        let goal: Vec<Vec2> = pos.iter().map(|p| -*p).collect();
+        let mut vel = vec![Vec2::ZERO; n];
+        let mut swap = Swap { arrived: 0, stalled: 0, turning_ccw: 0, turning_cw: 0 };
+        let (mut gone, mut slow) = (vec![false; n], vec![0u32; n]);
+        let params = CrowdParams { nudge, ..CrowdParams::new(3.0) };
+        let mut crowd = Crowd::default();
+        let (mut members, mut slots) = (Vec::new(), Vec::new());
+        for _ in 0..(3.0 * 2.0 * ring / speed / dt) as usize {
+            members.clear();
+            slots.clear();
+            for i in (0..n).filter(|&i| !gone[i]) {
+                let pref = (goal[i] - pos[i]).clamp_length_max(speed);
+                members.push(CrowdMember {
+                    key: i as u64,
+                    pos: pos[i],
+                    vel: vel[i],
+                    radius,
+                    max_speed: speed,
+                    pref_vel: Some(pref),
+                });
+                slots.push(i);
+            }
+            if members.is_empty() {
+                break;
+            }
+            let solved = crowd.solve(&members, &params, dt, |_, _| true, |_, b| b.clear());
+            for (&i, v) in slots.iter().zip(solved) {
+                vel[i] = v.expect("solved");
+                pos[i] += vel[i] * dt;
+            }
+            for &i in &slots {
+                let from_centre = pos[i].length();
+                if pos[i].distance(goal[i]) < 0.5 {
+                    gone[i] = true;
+                } else if vel[i].length() < 0.05 * speed {
+                    slow[i] += 1;
+                    // Counted once, on the step the stop reaches two seconds.
+                    if slow[i] == (2.0 / dt) as u32 + 1 {
+                        swap.stalled += 1;
+                    }
+                } else {
+                    slow[i] = 0;
+                    if (0.1 * ring..0.5 * ring).contains(&from_centre) {
+                        let turn = pos[i].perp_dot(vel[i]);
+                        swap.turning_ccw += usize::from(turn > 0.0);
+                        swap.turning_cw += usize::from(turn < 0.0);
+                    }
+                }
+            }
+        }
+        swap.arrived = gone.iter().filter(|g| **g).count();
+        swap
+    }
+
+    /// The circle swap at the defaults is every stream crossing every other. With a side drawn per key a
+    /// third of a 75-agent ring stopped for over two seconds on the way; with one side for everyone
+    /// they all arrive, and none of them stops.
+    #[test]
+    fn a_circle_swap_arrives_and_nobody_stalls() {
+        let n = 75;
+        let swap = circle_swap(n, 0.05);
+        assert_eq!(
+            (swap.arrived, swap.stalled),
+            (n, 0),
+            "{} of {n} arrived, {} stalled",
+            swap.arrived,
+            swap.stalled
+        );
+    }
+
+    /// The one side is what turns the swap into a vortex: nearly every agent that is crossing the middle
+    /// turns the same way, counter-clockwise for a positive `nudge` (each kicked to its right, as a
+    /// right-hand-traffic roundabout turns) and clockwise for a negative one. A side drawn per key
+    /// turned them every which way.
+    #[test]
+    fn the_side_of_the_kick_sets_which_way_a_crowd_turns() {
+        for (nudge, ccw) in [(0.05, true), (-0.05, false)] {
+            let swap = circle_swap(75, nudge);
+            let (with, against) =
+                if ccw { (swap.turning_ccw, swap.turning_cw) } else { (swap.turning_cw, swap.turning_ccw) };
+            assert!(
+                with as f32 > 0.9 * (with + against) as f32,
+                "nudge {nudge}: {with} agent-steps turned with the kick and {against} against it"
+            );
+        }
     }
 
     /// An unsteered member is never solved for, and the steered one takes the *full* avoidance against
