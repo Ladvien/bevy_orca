@@ -24,15 +24,19 @@
 //!
 //! # Scope
 //!
-//! Only agent↔agent avoidance lives here. Static geometry is the caller's concern in two senses: a
-//! global navigator should not route through solid space in the first place, and final contact is
-//! whatever the caller's collision resolver says it is. Walls therefore enter only as the optional
-//! `walls` half-planes described on [`new_velocity`] — the LP's *obstacle-line* count from static
-//! geometry is otherwise zero.
+//! Agent↔agent avoidance is [`new_velocity_in`]; static geometry is [`Obstacles`]. Walls enter the
+//! linear program as hard `walls` half-planes, either ones the caller computes (a door that opens, a
+//! corridor's two sides) or the ones [`Obstacles::push_walls`] derives from polygons and wall
+//! segments the caller built once: RVO2's obstacle lines, with its legs round convex corners. The
+//! two compose; both are satisfied before any neighbour, and neither is ever relaxed. A global
+//! navigator should still not route through solid space, and final contact is whatever the
+//! caller's collision resolver says it is.
 
 pub mod crowd;
+pub mod obstacles;
 
 pub use crowd::{Crowd, CrowdMember, CrowdParams};
+pub use obstacles::{ObstacleError, Obstacles, ObstaclesBuilder};
 
 use bevy_math::Vec2;
 
@@ -103,6 +107,8 @@ impl Line {
 pub struct OrcaScratch {
     lines: Vec<Line>,
     proj_lines: Vec<Line>,
+    /// The obstacle edges near one agent, `(squared distance, edge)`, for [`Obstacles::push_walls`].
+    near_edges: Vec<(f32, u32)>,
 }
 
 /// 2-D cross product (signed area); `> 0` means `b` is left of `a`.
@@ -263,7 +269,7 @@ pub fn new_velocity_in(
     }
 
     // Split the two buffers out of the scratch so the LP can hold `lines` while filling `proj_lines`.
-    let OrcaScratch { lines, proj_lines } = scratch;
+    let OrcaScratch { lines, proj_lines, .. } = scratch;
     lines.clear();
     lines.reserve(walls.len() + neighbors.len());
 
