@@ -134,12 +134,12 @@ fn step(mut walkers: Query<(&mut Walker, &mut Transform)>) {
 
     let mut solved: Vec<Vec2> = Vec::with_capacity(snapshot.len());
     for (i, (pos, vel, goal)) in snapshot.iter().enumerate() {
-        let me = Agent { pos: *pos, vel: *vel, radius: AGENT_R, avoids: true };
+        let me = Agent { pos: *pos, vel: *vel, radius: AGENT_R, avoids: true, priority: 1.0 };
         let neighbors: Vec<Agent> = snapshot
             .iter()
             .enumerate()
             .filter(|(j, _)| *j != i)
-            .map(|(_, (p, v, _))| Agent { pos: *p, vel: *v, radius: AGENT_R, avoids: true })
+            .map(|(_, (p, v, _))| Agent { pos: *p, vel: *v, radius: AGENT_R, avoids: true, priority: 1.0 })
             .collect();
 
         // Where it would go with no one in the way. Ease off near the goal so arrivals settle instead
