@@ -20,8 +20,8 @@ That reciprocity is the whole point. Summed-force separation makes two agents on
 use bevy_math::Vec2;
 use bevy_orca::{Agent, new_velocity};
 
-let me = Agent { pos: Vec2::new(-1.0, 0.0), vel: Vec2::X, radius: 0.5, avoids: true };
-let them = Agent { pos: Vec2::new(1.0, 0.0), vel: -Vec2::X, radius: 0.5, avoids: true };
+let me = Agent { pos: Vec2::new(-1.0, 0.0), vel: Vec2::X, radius: 0.5, avoids: true, priority: 1.0 };
+let them = Agent { pos: Vec2::new(1.0, 0.0), vel: -Vec2::X, radius: 0.5, avoids: true, priority: 1.0 };
 
 let v = new_velocity(
     &me,
@@ -34,7 +34,7 @@ let v = new_velocity(
 );
 ```
 
-`avoids` is whether that neighbour is *also* running avoidance. When it is, the pair splits the avoidance 50/50; when it is not — an idle agent holding ground — the mover takes the **full** avoidance, so a stationary agent is not assumed to step aside and then walked through.
+`avoids` is whether that neighbour is *also* running avoidance. When it is, the pair splits the avoidance 50/50 (unless their `priority` differs: see [right of way](#right-of-way)); when it is not — an idle agent holding ground — the mover takes the **full** avoidance, so a stationary agent is not assumed to step aside and then walked through.
 
 **The result is always finite, whatever you hand in.** A paused frame, a first frame or a time-scale of 0 hands in `dt = 0`, a physics blow-up hands in a NaN velocity, and a NaN written into a caller's `Transform` makes its agent vanish for good. So every input the solve cannot use has one documented answer:
 
@@ -67,6 +67,7 @@ let members: Vec<CrowdMember> = people
         radius: 0.4,
         max_speed: 1.6,
         pref_vel: Some(p.wish),         // None = another system moves this one this step
+        priority: 1.0,                  // right of way against another member that steps aside; 1.0 = equal
     })
     .collect();
 
