@@ -658,6 +658,77 @@ fn an_agent_touching_a_wall_within_rounding_cannot_walk_into_it() {
     assert!(worst <= ROUNDING, "a touching walker went {worst} into the wall in one step");
 }
 
+/// A walker a few ulps from a convex corner of a building, on the extension of one of its faces, creeping
+/// along it with its wish into the corner, was handed no line at all and stepped into the corner by a
+/// whole step. Viewed obliquely from beyond the end of a face, an edge defines the velocity obstacle by
+/// the vertex, and the leg that lies along its own face was replaced by that face's direction and skipped
+/// as "cast by the neighbour": the neighbour being itself. Found by a crowd on random caves (28
+/// agent-steps in 21.6 million, 4.7 cm into a cell); the state is a walker at `(0.3, 24.000284)` beside the
+/// corner `(0, 24)`, speed 0.03, wishing for `(-1.45, 0.4)`.
+#[test]
+fn an_agent_creeping_past_a_convex_corner_cannot_step_into_it() {
+    let mut scratch = OrcaScratch::default();
+    let mut walls = Vec::new();
+    // One step of an agent at `pos` among `building`: how far its disc ends inside it.
+    let mut step = |building: &[Solid; 1], obstacles: &Obstacles, pos: Vec2, vel: Vec2, pref: Vec2| -> f32 {
+        let agent = Agent { pos, vel, radius: RADIUS, avoids: true };
+        walls.clear();
+        obstacles.push_walls(&mut scratch, &agent, SPEED, 0.5, &mut walls);
+        let answer = new_velocity_in(&mut scratch, &agent, pref, &[], &walls, 2.0, DT, SPEED);
+        deepest(building, &[pos + answer * DT])
+    };
+    let building = [Solid::Box { centre: v(-0.5, 23.5), half: Vec2::splat(0.5) }];
+    let obstacles = obstacles_of(&building);
+    let found =
+        step(&building, &obstacles, v(0.3, 24.000_284), v(5.98e-5, -0.031_08), v(-1.446_931_8, 0.395_459_62));
+    assert!(found <= ROUNDING, "the walker from the caves went {found} into the corner in one step");
+
+    // Then every corner of a box, on the extension of each of its two faces, a few ulps to a few
+    // millimetres from touching and from the end of the face, creeping or still, wishing for the corner.
+    let (centre, half) = (v(2.0, -1.0), v(1.5, 0.5));
+    let building = [Solid::Box { centre, half }];
+    let obstacles = obstacles_of(&building);
+    let mut counter = 61u64;
+    let mut worst = 0.0f32;
+    let mut lines = 0usize;
+    for _ in 0..40_000 {
+        let corner = centre
+            + v(
+                if draw(&mut counter).is_multiple_of(2) { -half.x } else { half.x },
+                if draw(&mut counter).is_multiple_of(2) { -half.y } else { half.y },
+            );
+        let (sx, sy) = ((corner.x - centre.x).signum(), (corner.y - centre.y).signum());
+        // Outward normal of the face, and the direction along its extension away from the box.
+        let (normal, along) = if draw(&mut counter).is_multiple_of(2) {
+            (v(sx, 0.0), v(0.0, sy))
+        } else {
+            (v(0.0, sy), v(sx, 0.0))
+        };
+        // Exactly touching the face's line (the oblique branch needs the disc no nearer than the face)
+        // is the case that matters, so it is drawn most often; the overshoot is how far past the end
+        // of the face the walker is, from nothing to 3 mm.
+        let delta = [0.0, 0.0, 0.0, 4e-8, 1e-7, 1e-6, 1e-5, 1e-4, 1e-3][(draw(&mut counter) % 9) as usize];
+        let overshoot = [0.0, 1e-5, 1e-4, 2e-4, 3e-4, 1e-3, 3e-3][(draw(&mut counter) % 7) as usize];
+        let pos = corner + normal * (RADIUS + delta) + along * overshoot;
+        let creep = [0.0, 1e-5, 0.03, 0.1][(draw(&mut counter) % 4) as usize];
+        let angle = unit(&mut counter) * core::f32::consts::TAU;
+        let vel = if draw(&mut counter).is_multiple_of(2) {
+            along * -creep + normal * ((unit(&mut counter) - 0.5) * 4e-4)
+        } else {
+            v(angle.cos(), angle.sin()) * creep
+        };
+        let wobble = unit(&mut counter) - 0.5;
+        let aim = corner - pos;
+        let pref = (aim.normalize() + aim.perp().normalize() * wobble).normalize() * SPEED;
+        worst = worst.max(step(&building, &obstacles, pos, vel, pref));
+        lines += 1;
+    }
+    assert!(
+        lines == 40_000 && worst <= ROUNDING,
+        "a walker at a corner went {worst} into the building in one step"
+    );
+}
+
 /// The lines are hard: whatever the crowd does to a member, the velocity it is given satisfies every
 /// obstacle line cast on it, to rounding. (A host's own `f32` positions, summed step after step at a
 /// coordinate of a hundred metres, can still lose a few `1e-5` m a step; this is the solver's half.)
@@ -806,4 +877,193 @@ fn a_courtyard_is_an_enclosure_inside_a_solid() {
     }
     assert!(worst_in <= ROUNDING, "a courtyard walker's disc reached {worst_in} into the building");
     assert!(worst_out <= ROUNDING, "a walker outside got {worst_out} into the building");
+}
+
+fn cells_of(origin: Vec2, size: f32, width: usize, solid: &[bool]) -> Obstacles {
+    let mut builder = ObstaclesBuilder::new();
+    builder.add_cells(origin, size, width, solid).expect("a grid");
+    builder.build().expect("every grid builds")
+}
+
+/// A random grid, `fill` of its cells solid.
+fn random_cells(counter: &mut u64, width: usize, height: usize, fill: f32) -> Vec<bool> {
+    (0..width * height).map(|_| unit(counter) < fill).collect()
+}
+
+/// A block of cells is its box: the lines a walker is given beside it are bit for bit the lines the box
+/// gives, so a host that already placed `add_box` per building changes nothing by handing over its grid.
+#[test]
+fn a_block_of_cells_gives_the_lines_of_a_box() {
+    let (origin, size, width, height) = (v(-8.0, 4.0), 2.0, 16usize, 12usize);
+    // Blocks that do not touch: a gap of a cell or more between any two.
+    let blocks = [(1usize, 1usize, 4usize, 3usize), (7, 1, 3, 3), (12, 2, 2, 7), (2, 6, 6, 4), (9, 7, 2, 4)];
+    let mut solid = vec![false; width * height];
+    let mut builder = ObstaclesBuilder::new();
+    for &(c, r, w, h) in &blocks {
+        for row in r..r + h {
+            for column in c..c + w {
+                solid[row * width + column] = true;
+            }
+        }
+        let half = v(w as f32, h as f32) * size * 0.5;
+        builder.add_box(origin + v(c as f32, r as f32) * size + half, half).expect("a box");
+    }
+    let boxes = builder.build().expect("boxes");
+    let cells = cells_of(origin, size, width, &solid);
+    assert_eq!(cells.len(), boxes.len());
+
+    let mut counter = 3u64;
+    let mut scratch = OrcaScratch::default();
+    let (mut lines, mut asked) = (0usize, 0usize);
+    for _ in 0..4000 {
+        let pos = origin + v(unit(&mut counter) * width as f32, unit(&mut counter) * height as f32) * size;
+        let vel = v(unit(&mut counter) - 0.5, unit(&mut counter) - 0.5) * 3.0;
+        let agent = Agent { pos, vel, radius: RADIUS, avoids: true };
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        cells.push_walls(&mut scratch, &agent, SPEED, 0.5, &mut a);
+        boxes.push_walls(&mut scratch, &agent, SPEED, 0.5, &mut b);
+        let key = |l: &(Vec2, f32)| (l.0.x.to_bits(), l.0.y.to_bits(), l.1.to_bits());
+        a.sort_by_key(key);
+        b.sort_by_key(key);
+        assert_eq!(a, b, "different lines for an agent at {pos}");
+        lines += a.len();
+        asked += 1;
+    }
+    assert!(lines > asked / 10, "the sweep barely met a wall: {lines} lines for {asked} agents");
+}
+
+/// The deepest any of `agents`' discs reaches into a solid cell of the grid.
+fn deepest_in_cells(origin: Vec2, size: f32, width: usize, solid: &[bool], agents: &[Vec2]) -> f32 {
+    let height = solid.len() / width;
+    agents
+        .iter()
+        .map(|&p| {
+            // Only the cells within a radius of the agent can be reached; the grid is small enough to
+            // look at the 3 × 3 block around it and no more.
+            let cell = ((p - origin) / size).floor();
+            let mut deepest = 0.0f32;
+            for dr in -1..=1i64 {
+                for dc in -1..=1i64 {
+                    let (c, r) = (cell.x as i64 + dc, cell.y as i64 + dr);
+                    if c < 0
+                        || r < 0
+                        || c >= width as i64
+                        || r >= height as i64
+                        || !solid[r as usize * width + c as usize]
+                    {
+                        continue;
+                    }
+                    let b = Solid::Box {
+                        centre: origin + v(c as f32 + 0.5, r as f32 + 0.5) * size,
+                        half: Vec2::splat(size * 0.5),
+                    };
+                    deepest = deepest.max(RADIUS - b.distance(p));
+                }
+            }
+            deepest
+        })
+        .fold(0.0, f32::max)
+}
+
+/// A crowd on a random cave never puts a disc into a solid cell: pinches where two cells meet at a
+/// corner, one-cell walls, one-cell gaps and dead ends, at 30% and 50% solid, with every walker
+/// wishing to go through the rock to a far goal.
+#[test]
+fn a_crowd_on_a_random_map_never_enters_a_solid_cell() {
+    let params = CrowdParams::new(3.0);
+    let (origin, size, width, height) = (v(-3.0, 5.0), 1.0, 30usize, 30usize);
+    let mut worst = 0.0f32;
+    let mut moved = 0.0f32;
+    let mut counter = 17u64;
+    for scene in 0..16usize {
+        let fill = if scene < 8 { 0.3 } else { 0.5 };
+        let solid = random_cells(&mut counter, width, height, fill);
+        let obstacles = cells_of(origin, size, width, &solid);
+        // Walkers start at the centres of distinct open cells (half a cell from any rock, so clear).
+        let open: Vec<usize> = (0..solid.len()).filter(|&i| !solid[i]).collect();
+        let mut agents: Vec<(Vec2, Vec2)> = Vec::new();
+        let mut taken = std::collections::BTreeSet::new();
+        while agents.len() < 40.min(open.len()) {
+            let cell = open[(draw(&mut counter) % open.len() as u64) as usize];
+            if taken.insert(cell) {
+                agents.push((
+                    origin + v((cell % width) as f32 + 0.5, (cell / width) as f32 + 0.5) * size,
+                    Vec2::ZERO,
+                ));
+            }
+        }
+        let mut goals: Vec<Vec2> = agents.iter().map(|_| Vec2::ZERO).collect();
+        let mut crowd = Crowd::default();
+        for step in 0..600usize {
+            if step % 150 == 0 {
+                for g in &mut goals {
+                    *g = origin
+                        + v(unit(&mut counter) * width as f32, unit(&mut counter) * height as f32) * size;
+                }
+            }
+            let members: Vec<CrowdMember> = agents
+                .iter()
+                .enumerate()
+                .map(|(i, &(pos, vel))| CrowdMember {
+                    key: i as u64,
+                    pos,
+                    vel,
+                    radius: RADIUS,
+                    max_speed: SPEED,
+                    pref_vel: Some((goals[i] - pos).clamp_length_max(SPEED)),
+                })
+                .collect();
+            let solved = crowd.solve_around(&obstacles, &members, &params, DT, |_, _| true, |_, _| {});
+            for (agent, s) in agents.iter_mut().zip(solved) {
+                agent.1 = s.expect("solved");
+                agent.0 += agent.1 * DT;
+                moved += agent.1.length() * DT;
+            }
+            let positions: Vec<Vec2> = agents.iter().map(|a| a.0).collect();
+            worst = worst.max(deepest_in_cells(origin, size, width, &solid, &positions));
+        }
+    }
+    assert!(moved > 2_000.0, "the crowds barely moved: {moved} m in all");
+    assert!(worst <= ROUNDING, "a walker's disc reached {worst} into a solid cell");
+}
+
+/// Two solid cells that meet at a corner shut the gap between them: a walker whose straight line runs
+/// through the touching point is stopped by the cells on either side, however long it pushes.
+#[test]
+fn a_gap_between_cells_that_touch_at_a_corner_is_shut() {
+    let (origin, size, width) = (Vec2::ZERO, 1.0, 10usize);
+    for diagonal in [false, true] {
+        let mut solid = vec![false; 100];
+        // Solid at (4, 4) and (5, 5), or at (5, 4) and (4, 5): the touching point is (5, 5).
+        let cells = if diagonal { [(5, 4), (4, 5)] } else { [(4, 4), (5, 5)] };
+        for (c, r) in cells {
+            solid[r * width + c] = true;
+        }
+        let obstacles = cells_of(origin, size, width, &solid);
+        assert_eq!(obstacles.len(), 8, "two separate squares");
+        // From the middle of one open diagonal cell to the middle of the other, through the point.
+        let (start, goal) = if diagonal { (v(4.5, 4.5), v(5.5, 5.5)) } else { (v(5.5, 4.5), v(4.5, 5.5)) };
+        let params = CrowdParams::new(3.0);
+        let mut crowd = Crowd::default();
+        let (mut pos, mut vel, mut worst) = (start, Vec2::ZERO, 0.0f32);
+        for _ in 0..600 {
+            let member = CrowdMember {
+                key: 0,
+                pos,
+                vel,
+                radius: RADIUS,
+                max_speed: SPEED,
+                pref_vel: Some((goal - pos).clamp_length_max(SPEED)),
+            };
+            vel = crowd.solve_around(&obstacles, &[member], &params, DT, |_, _| true, |_, _| {})[0]
+                .expect("solved");
+            pos += vel * DT;
+            worst = worst.max(deepest_in_cells(origin, size, width, &solid, &[pos]));
+        }
+        assert!(worst <= ROUNDING, "the disc reached {worst} into a cell (diagonal = {diagonal})");
+        assert!(
+            pos.distance(goal) > 0.4,
+            "the walker got through the point to {pos} (diagonal = {diagonal})"
+        );
+    }
 }

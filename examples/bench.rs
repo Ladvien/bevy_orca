@@ -1,6 +1,6 @@
 //! **The crowd bench: what one `Crowd::solve` step costs a host, and what it gets right.**
 //!
-//! Eight scenes, each at 100, 1 000, 5 000 and 10 000 agents:
+//! Ten scenes, each at 100, 1 000, 5 000 and 10 000 agents:
 //!
 //! - `open` — random walkers at 0.5 agents/m², each walking to goals drawn from its own key;
 //! - `circle` — the circle swap, every agent walking to its antipode, 1 m of ring per agent;
@@ -17,12 +17,19 @@
 //!   and a walker whose disc ends a step inside a building is put back on its surface (Sanctuary's
 //!   `push_out_of_box`). It also prints `pushed` (agent-steps that needed it) and `push_max` (the
 //!   deepest, in metres).
+//! - `city_cells` — the same city given as a grid of 1 m solid cells (a building is an 8 × 8 square of
+//!   them) and traced into outlines by `ObstaclesBuilder::add_cells`: the lines, and so the walkers, are
+//!   `city`'s. It prints `edges` (the obstacle edges) and `build_us` (what the builder took);
+//! - `city_boxes` — that same grid the way a host does it without `add_cells`: one `add_box` per solid
+//!   cell, four edges for every cell however deep in a building. The same walkers again, so the step
+//!   time and the edges are the price of feeding the grid in cell by cell.
 //!
 //! Each case runs 20 warm-up steps and 480 timed ones, then prints one line:
 //!
 //! ```text
 //! orca: <scene> agents=<n> threads=<t> order=<fwd|rev> median_us=<x> p99_us=<y> agents_per_ms=<a>
-//!       cand_mean=<c> cand_max=<m> hash=<h> [overlap_max=<o> wall_max=<w> speed_max=<s> allocs=<k>]
+//!       cand_mean=<c> cand_max=<m> hash=<h> [overlap_max=<o> wall_max=<w> speed_max=<s> allocs=<k>
+//!       edges=<e> build_us=<b>]
 //! ```
 //!
 //! - `median_us` / `p99_us` — one step's solve, the part a host pays every tick. Building the member
@@ -40,15 +47,18 @@
 //!   above `1.000001` is the linear program's answer leaving the speed disc. `allocs` — allocations
 //!   made inside the timed `Crowd::solve` calls: a warm `Crowd` allocates only while a buffer grows to
 //!   a wider call than it has seen, so a scene that densifies shows a handful, never one per step.
-//!   These four are measured on the `threads=1 order=fwd` run.
+//!   These four are measured on the `threads=1 order=fwd` run. `edges` — the obstacle edges the scene's
+//!   `Obstacles` has, and `build_us` the microseconds `ObstaclesBuilder` took to make them (the scenes
+//!   that have obstacles).
 //!
 //! After each scene, `scaling_1k_10k` is the exponent of the median step from 1 000 to 10 000 agents
 //! at constant density: 1.0 is linear.
 //!
 //! A second section, `arrive`, runs the circle swap at 20, 100 and 1 000 agents (1 m of ring per agent)
 //! and at 20 agents on the `circle_swap` example's wider ring, a 100-agent two-way corridor, the
-//! bottleneck and `bottleneck_obst` at 100, 200 and 400 agents, and the city and `city_pushout` at 100
-//! and 1 000 (each walker leaves at its goal), each for three times the longest straight-line time.
+//! bottleneck and `bottleneck_obst` at 100, 200 and 400 agents, and the four cities (`city`,
+//! `city_pushout`, `city_cells`, `city_boxes`) at 100 and 1 000 (each walker leaves at its goal), each
+//! for three times the longest straight-line time.
 //! It prints the fraction that arrived (in the bottleneck, that got through the gap), how many stalled
 //! (under 5% of their preferred speed for more than 2 s, away from their goal), and `t50_s` / `t90_s`,
 //! when half and nine tenths had arrived. The 20 agents on the 1 m ring never arrive: that ring is the
@@ -198,10 +208,15 @@ enum Scene {
     /// The same city the way the consumers do it today: nothing in the solve, and a push-out of any
     /// walker whose disc ends a step inside a building.
     CityPushout,
+    /// The same city, its buildings given as a grid of 1 m solid cells and traced into outlines by
+    /// `ObstaclesBuilder::add_cells`: the same lines as `city`, from the grid a tile-map host holds.
+    CityCells,
+    /// The same grid the way a host does it without `add_cells`: one `add_box` per solid cell.
+    CityBoxes,
 }
 
 impl Scene {
-    const ALL: [Scene; 8] = [
+    const ALL: [Scene; 10] = [
         Scene::Open,
         Scene::Circle,
         Scene::Corridor,
@@ -210,6 +225,8 @@ impl Scene {
         Scene::BottleneckObst,
         Scene::City,
         Scene::CityPushout,
+        Scene::CityCells,
+        Scene::CityBoxes,
     ];
 
     fn name(self) -> &'static str {
@@ -222,6 +239,8 @@ impl Scene {
             Scene::BottleneckObst => "bottleneck_obst",
             Scene::City => "city",
             Scene::CityPushout => "city_pushout",
+            Scene::CityCells => "city_cells",
+            Scene::CityBoxes => "city_boxes",
         }
     }
 
@@ -231,7 +250,7 @@ impl Scene {
     }
 
     fn is_city(self) -> bool {
-        matches!(self, Scene::City | Scene::CityPushout)
+        matches!(self, Scene::City | Scene::CityPushout | Scene::CityCells | Scene::CityBoxes)
     }
 }
 
@@ -310,6 +329,8 @@ struct World {
     /// The static geometry the solve is given (the bottleneck's wall, the city's buildings); empty
     /// for the scenes that do not use `Obstacles`.
     obstacles: Obstacles,
+    /// Seconds the scene's `ObstaclesBuilder` took to build `obstacles`, in microseconds.
+    build_us: f64,
     /// The city: buildings per side, the first waypoint of each walker's route (the second is its
     /// goal), and which one it is walking to.
     blocks: usize,
@@ -339,6 +360,7 @@ impl World {
         let mut segments = Vec::new();
         let (mut blocks, mut route, mut lateral) = (0usize, Vec::new(), Vec::new());
         let mut obstacles = Obstacles::default();
+        let mut build_us = 0.0f64;
         match scene {
             Scene::Open => {
                 // A jittered grid at 0.5 agents/m², so nobody starts inside anybody.
@@ -415,7 +437,7 @@ impl World {
                     goal.push(Vec2::ZERO);
                 }
             }
-            Scene::City | Scene::CityPushout => {
+            Scene::City | Scene::CityPushout | Scene::CityCells | Scene::CityBoxes => {
                 // Buildings on a lattice, streets between them. Walkers start on the horizontal streets
                 // in four lanes, and walk along the street middles: first along their own street to
                 // their goal's column, then along that column to the goal, a street crossing.
@@ -443,16 +465,43 @@ impl World {
                     route.push(Vec2::new(g.x, street as f32 * PITCH));
                     lateral.push((lane as f32 - 1.5) * usable / 3.0);
                 }
-                if scene == Scene::City {
-                    let mut builder = ObstaclesBuilder::new();
-                    for i in 0..k {
-                        for j in 0..k {
-                            let centre = Vec2::new((i as f32 + 0.5) * PITCH, (j as f32 + 0.5) * PITCH);
-                            builder.add_box(centre, Vec2::splat(BLOCK * 0.5)).expect("a building");
+                let started = Instant::now();
+                match scene {
+                    Scene::City => {
+                        let mut builder = ObstaclesBuilder::new();
+                        for i in 0..k {
+                            for j in 0..k {
+                                let centre = Vec2::new((i as f32 + 0.5) * PITCH, (j as f32 + 0.5) * PITCH);
+                                builder.add_box(centre, Vec2::splat(BLOCK * 0.5)).expect("a building");
+                            }
                         }
+                        obstacles = builder.build().expect("buildings");
                     }
-                    obstacles = builder.build().expect("buildings");
+                    Scene::CityCells | Scene::CityBoxes => {
+                        // The city as a tile map: 1 m cells, a building the `BLOCK`-wide square of cells
+                        // in the middle of each `PITCH` lattice cell (the same corners as `city`'s boxes).
+                        let side = k * PITCH as usize;
+                        let (offset, size) = ((PITCH - BLOCK) as usize / 2, BLOCK as usize);
+                        let solid: Vec<bool> = (0..side * side)
+                            .map(|i| {
+                                let (x, y) = (i % side % PITCH as usize, i / side % PITCH as usize);
+                                (offset..offset + size).contains(&x) && (offset..offset + size).contains(&y)
+                            })
+                            .collect();
+                        let mut builder = ObstaclesBuilder::new();
+                        if scene == Scene::CityCells {
+                            builder.add_cells(Vec2::ZERO, 1.0, side, &solid).expect("a grid");
+                        } else {
+                            for i in (0..solid.len()).filter(|&i| solid[i]) {
+                                let centre = Vec2::new((i % side) as f32 + 0.5, (i / side) as f32 + 0.5);
+                                builder.add_box(centre, Vec2::splat(0.5)).expect("a cell");
+                            }
+                        }
+                        obstacles = builder.build().expect("cells");
+                    }
+                    _ => {}
                 }
+                build_us = started.elapsed().as_secs_f64() * 1e6;
             }
         }
         World {
@@ -468,6 +517,7 @@ impl World {
             extent,
             segments,
             obstacles,
+            build_us,
             blocks,
             stage: vec![0; route.len()],
             route,
@@ -512,7 +562,7 @@ impl World {
                     Vec2::X * SPEED
                 }
             }
-            Scene::City | Scene::CityPushout => {
+            Scene::City | Scene::CityPushout | Scene::CityCells | Scene::CityBoxes => {
                 // A wish that follows the street, as a navigator's would: a carrot a few metres ahead
                 // along the street the walker is on, at the walker's own lateral offset in it. (Aimed
                 // at a waypoint a street away, a walker pushed off its line aims into a building.)
@@ -536,7 +586,9 @@ impl World {
             | Scene::Rally
             | Scene::BottleneckObst
             | Scene::City
-            | Scene::CityPushout => {}
+            | Scene::CityPushout
+            | Scene::CityCells
+            | Scene::CityBoxes => {}
             Scene::Corridor => {
                 let half = CORRIDOR_WIDTH * 0.5;
                 buf.push((Vec2::Y, (half - p.y - RADIUS).max(0.0) / DT));
@@ -563,7 +615,7 @@ impl World {
             Scene::Bottleneck | Scene::BottleneckObst => {
                 self.segments.iter().map(|s| (RADIUS - s.closest(p).distance(p)).max(0.0)).fold(0.0, f32::max)
             }
-            Scene::City | Scene::CityPushout => self
+            Scene::City | Scene::CityPushout | Scene::CityCells | Scene::CityBoxes => self
                 .buildings_near(p)
                 .map(|c| (RADIUS - box_distance(p, c, Vec2::splat(BLOCK * 0.5))).max(0.0))
                 .fold(0.0, f32::max),
@@ -607,7 +659,7 @@ impl World {
                 Scene::Bottleneck | Scene::BottleneckObst => self.gone[a] |= p.x > 3.0,
                 // Nobody leaves a rally: the press on its centre is the scene.
                 Scene::Rally => {}
-                Scene::City | Scene::CityPushout => {
+                Scene::City | Scene::CityPushout | Scene::CityCells | Scene::CityBoxes => {
                     let (route, goal) = (self.route[a], self.goal[a]);
                     // Reached the column of the goal, or the goal itself.
                     let reached = if self.stage[a] == 0 {
@@ -864,6 +916,9 @@ struct Outcome {
     /// The push-out city: agent-steps that ended inside a building, and the deepest of them.
     pushed: u64,
     push_max: f32,
+    /// The scene's obstacle edges, and the microseconds `ObstaclesBuilder` took to make them.
+    edges: usize,
+    build_us: f64,
 }
 
 /// 20 warm-up and 480 timed steps of one scene. `threads == 0` is `Crowd::solve`; otherwise the
@@ -972,6 +1027,8 @@ fn run(scene: Scene, n: usize, threads: usize, reversed: bool, measure: bool) ->
         allocs: alloc_total,
         pushed: world.pushed,
         push_max: world.push_max,
+        edges: world.obstacles.len(),
+        build_us: world.build_us,
     }
 }
 
@@ -996,6 +1053,9 @@ fn line(scene: Scene, n: usize, threads: usize, reversed: bool, o: &Outcome, mea
     }
     if measured && scene == Scene::CityPushout {
         s += &format!(" pushed={} push_max={:.4}", o.pushed, o.push_max);
+    }
+    if measured && o.edges > 0 {
+        s += &format!(" edges={} build_us={:.0}", o.edges, o.build_us);
     }
     println!("{s}");
 }
@@ -1143,7 +1203,7 @@ fn main() {
                 arrive(Scene::BottleneckObst, n, 1.0);
             }
         }
-        for scene in [Scene::City, Scene::CityPushout] {
+        for scene in [Scene::City, Scene::CityPushout, Scene::CityCells, Scene::CityBoxes] {
             if wanted(scene) {
                 for n in [100, 1_000] {
                     arrive(scene, n, 1.0);
