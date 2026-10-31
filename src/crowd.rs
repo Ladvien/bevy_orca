@@ -39,7 +39,8 @@ pub struct CrowdMember {
     /// `None` means another system moves this member this step: it is a neighbour to everyone else and
     /// is never solved for. Its velocity is still read, so the agent that is moving it is avoided, and
     /// in full: a member this step does not move is not assumed to step aside. A wish that is not
-    /// finite is the same as `None`.
+    /// finite is the same as `None`; a finite one is always a wish, however long — one too long to
+    /// square (above `1.8e19`) is a direction at full speed, not a stop.
     pub pref_vel: Option<Vec2>,
 }
 
@@ -59,7 +60,8 @@ pub struct CrowdParams {
     pub max_neighbours: usize,
     /// Sideways kick, as a fraction of the wish, applied when a member has any neighbour at all. It
     /// breaks the exact symmetry of a head-on meeting, which the linear program has no reason to
-    /// prefer either way and will otherwise stall.
+    /// prefer either way and will otherwise stall. A kick the wish cannot take — the nudged wish
+    /// is not finite, as for a wish near `f32::MAX`, or `nudge` is NaN — is not applied.
     pub nudge: f32,
 }
 
@@ -288,12 +290,15 @@ impl Crowd {
             }
 
             // The wish, nudged sideways when anyone is near. The side is the member's own, hashed from
-            // its key, so two agents meeting head-on do not both pick the same side.
+            // its key, so two agents meeting head-on do not both pick the same side. A nudge the wish
+            // cannot take — the sum is not finite, as for a wish near `f32::MAX` — is not applied: such
+            // a wish is a direction already, and `new_velocity_in` would refuse the non-finite sum.
             let wish = if self.near.is_empty() {
                 pref
             } else {
                 let side = if splitmix64(m.key) & 1 == 0 { 1.0 } else { -1.0 };
-                pref + pref.perp() * (params.nudge * side)
+                let nudged = pref + pref.perp() * (params.nudge * side);
+                if nudged.is_finite() { nudged } else { pref }
             };
 
             self.walls.clear();
@@ -371,6 +376,40 @@ mod tests {
         let v = solved[1].expect("the steered member is solved");
         assert!(v.is_finite());
         assert!((v - Vec2::X).length() > 1.0e-3, "expected avoidance, got {v}");
+    }
+
+    /// A finite wish is a direction however fast it is. A member whose wish is too long to square — or
+    /// too long to have the sideways nudge added to it, which a neighbour in range turns on — still
+    /// walks that way at full speed and is not stopped, as `new_velocity_in` does for the same wish.
+    #[test]
+    fn a_huge_finite_wish_still_moves_the_member() {
+        let mut crowd = Crowd::default();
+        let max = f32::MAX;
+        let wishes = [
+            (Vec2::new(1.0e20, 0.0), Vec2::X),
+            (Vec2::new(0.0, -1.0e30), -Vec2::Y),
+            (Vec2::new(1.0e30, 1.0e30), Vec2::ONE.normalize()),
+            (Vec2::new(max, max), Vec2::ONE.normalize()),
+            (Vec2::new(-max, max), Vec2::new(-1.0, 1.0).normalize()),
+        ];
+        for nudge in [0.0, 0.05] {
+            let params = CrowdParams { nudge, ..CrowdParams::new(4.0) };
+            for (wish, direction) in wishes {
+                // The neighbour stands behind the mover, so nothing constrains the way it wants to go.
+                let mover = member(1, Vec2::ZERO, Vec2::ZERO, Some(wish));
+                let behind = member(2, -direction * 1.2, Vec2::ZERO, None);
+                let solved =
+                    crowd.solve(&[mover, behind], &params, 1.0 / 60.0, |_, _| true, |_, buf| buf.clear());
+                let v = solved[0].expect("a finite wish is solved");
+                // A 5% nudge turns the wish by at most 0.05 rad, which moves a 1.5 m/s answer by 0.075.
+                let tolerance = if nudge == 0.0 { 1.0e-3 } else { 0.1 };
+                assert!(
+                    (v - direction * mover.max_speed).length() < tolerance,
+                    "wish {wish}, nudge {nudge}: got {v}, want {} along {direction}",
+                    mover.max_speed
+                );
+            }
+        }
     }
 
     /// A member this solve will not move — a wish it cannot use, or no speed to move at — is avoided

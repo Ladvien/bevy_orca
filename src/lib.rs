@@ -100,11 +100,34 @@ pub(crate) fn usable_speed(max_speed: f32) -> bool {
     max_speed > 0.0 && (max_speed * max_speed).is_finite()
 }
 
+/// `2^-96`: the power of two [`direction_of`] scales a vector by when its square is not a number.
+const OVERFLOW_SCALE: f32 = f32::from_bits((127 - 96) << 23);
+
+/// The unit vector along a finite `v`, or [`Vec2::ZERO`] if `v` is zero.
+///
+/// `normalize_or_zero` squares the components, so for a finite `v` longer than `sqrt(f32::MAX)` (about
+/// `1.8e19`) the square is `+inf`, the reciprocal length is `0`, and the answer is [`Vec2::ZERO`]: a wish
+/// to go that way as fast as possible would stop its agent (RVO2's `normalize` has the same hole). Such
+/// a vector is scaled by an exact power of two first, as Blue's algorithm scales the large values in
+/// LAPACK's `dnrm2`: a vector whose square overflows has a component of at least `2^63.5`, so after
+/// the scale its squares lie between `2^-65` and `2^65`, inside `f32`, and the direction is unchanged.
+/// Every `v` whose square is finite takes the unscaled path, so its result is the bits it always was.
+#[inline]
+fn direction_of(v: Vec2) -> Vec2 {
+    if v.length_squared().is_finite() {
+        v.normalize_or_zero()
+    } else {
+        (v * OVERFLOW_SCALE).normalize_or_zero()
+    }
+}
+
 /// Compute the collision-avoiding velocity for `agent` nearest to `pref_vel`, given `neighbors`.
 ///
 /// `time_horizon` is how many seconds ahead agent-agent collisions are anticipated (larger = more
 /// cautious, earlier avoidance); `dt` is the simulation step (used for the in-contact case); result
-/// magnitude is clamped to `max_speed`. Pure math — no panics.
+/// magnitude is clamped to `max_speed`: with nothing in the way a `pref_vel` longer than that is cut
+/// to `max_speed` along its own direction, however long it is — `(1e20, 0)` at a `max_speed` of `1.5`
+/// gives `(1.5, 0)`, not a stop. Pure math — no panics.
 ///
 /// Allocates a fresh line buffer per call. To solve repeatedly without allocating, own an
 /// [`OrcaScratch`] and call [`new_velocity_in`].
@@ -150,8 +173,10 @@ pub fn new_velocity(
 ///   skipped: it has no velocity obstacle. So is one whose constraint overflows `f32` relative to this
 ///   agent (agents near `±f32::MAX`), as if it were out of range.
 ///
-/// A `radius` of `0` is a point, and usable. Finite, in-range input passes every one of these tests,
-/// so none of them changes a single bit of a sane solve.
+/// A `radius` of `0` is a point, and usable. So is any finite `pref_vel`, including one too long to
+/// square (above about `1.8e19`): it is clamped to the speed disc along its own direction. Finite,
+/// in-range input passes every one of these tests, so none of them changes a single bit of a sane
+/// solve.
 // A solver's parameters are what the caller decides per step, and bundling them into a struct would
 // allocate a place to copy them into on every call — the opposite of this function's point. The eight
 // arguments mirror RVO2's `computeNewVelocity` and `new_velocity`'s own seven.
@@ -189,8 +214,12 @@ pub fn new_velocity_in(
         || !inv_time_horizon.is_finite()
     {
         // No time passes this step (a subnormal step is as good as none), so nothing can be
-        // constrained: take the wish.
-        return pref_vel.clamp_length_max(max_speed);
+        // constrained: take the wish, clamped to the speed disc like `linear_program2` clamps it.
+        return if pref_vel.length_squared().is_finite() {
+            pref_vel.clamp_length_max(max_speed)
+        } else {
+            direction_of(pref_vel) * max_speed
+        };
     }
 
     // Split the two buffers out of the scratch so the LP can hold `lines` while filling `proj_lines`.
@@ -372,7 +401,7 @@ fn linear_program2(
     if direction_opt {
         *result = opt_velocity * radius;
     } else if opt_velocity.length_squared() > radius * radius {
-        *result = opt_velocity.normalize_or_zero() * radius;
+        *result = direction_of(opt_velocity) * radius;
     } else {
         *result = opt_velocity;
     }
@@ -484,6 +513,65 @@ mod tests {
         let v = new_velocity(&a, Vec2::new(10.0, 0.0), &[], &[], 2.0, 1.0 / 60.0, max_speed);
         assert!(v.length() <= max_speed + 1.0e-4, "speed {} exceeds max {max_speed}", v.length());
         assert!((v.length() - max_speed).abs() < 1.0e-3, "should saturate the disc, got {}", v.length());
+    }
+
+    /// A finite wish whose square overflows f32 is still a direction: it is clamped to the speed disc,
+    /// not turned into a stop.
+    #[test]
+    fn a_huge_finite_wish_is_clamped_not_zeroed() {
+        let a = agent(Vec2::ZERO, Vec2::ZERO);
+        for dt in [1.0 / 60.0, 0.0] {
+            let v = new_velocity(&a, Vec2::new(1.0e20, 0.0), &[], &[], 2.0, dt, 1.5);
+            assert!((v - Vec2::new(1.5, 0.0)).length() < 1.0e-4, "dt {dt}: got {v}");
+        }
+    }
+
+    /// A wish far outside the speed disc is answered the same however far outside it is: the answer for
+    /// a wish too long to square is the answer for the same wish short enough to, with nothing in the
+    /// way, with a neighbour, with a wall, with both, and with no time passing.
+    #[test]
+    fn a_wish_too_long_to_square_gives_the_answer_of_one_that_is_not() {
+        let a = agent(Vec2::ZERO, Vec2::ZERO);
+        let ahead = [agent(Vec2::new(2.0, 0.0), Vec2::new(-1.0, 0.0))];
+        let wall = [(Vec2::Y, 0.4_f32)];
+        let mut scratch = OrcaScratch::default();
+        let max_speed = 1.5;
+        for with_neighbour in [false, true] {
+            for with_wall in [false, true] {
+                for dt in [1.0 / 60.0, 0.0] {
+                    let neighbours: &[Agent] = if with_neighbour { &ahead } else { &[] };
+                    let walls: &[(Vec2, f32)] = if with_wall { &wall } else { &[] };
+                    let dirs =
+                        [Vec2::X, Vec2::Y, -Vec2::X, -Vec2::Y, Vec2::new(0.6, 0.8), Vec2::new(-0.8, -0.6)];
+                    for dir in dirs {
+                        // 1e10 squares to 1e20: the same direction, short enough for the old arithmetic.
+                        let mut solve = |magnitude: f32| {
+                            new_velocity_in(
+                                &mut scratch,
+                                &a,
+                                dir * magnitude,
+                                neighbours,
+                                walls,
+                                2.0,
+                                dt,
+                                max_speed,
+                            )
+                        };
+                        let want = solve(1.0e10);
+                        assert!(want.length() > 0.1, "the reference for {dir} is a stop: {want}");
+                        for magnitude in [2.0e19, 1.0e20, 1.0e30, 3.0e38] {
+                            let got = solve(magnitude);
+                            assert!(got.is_finite() && got.length() <= max_speed * 1.0001, "got {got}");
+                            assert!(
+                                (got - want).length() < 1.0e-3,
+                                "wish {dir} x {magnitude}, dt {dt}, neighbour {with_neighbour}, wall {with_wall}: \
+                                 got {got}, want {want}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
