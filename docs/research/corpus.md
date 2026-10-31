@@ -2,6 +2,9 @@
 
 Every stem below is a home-still document (`distill_search` / `hs distill search` finds it; `markdown_read` reads it). A source the corpus lacks is listed under **Not in the corpus** with what was tried, so the next pass does not search for it again.
 
+Scanned last: iteration 9 (2026-10-31). `catalog_recent` (200 rows, 02:06-08:44 UTC; the rows past 06:10 are new since iteration 8) held nothing in these domains: psychology and pain-medicine papers, two candle-flame papers, a forest-ecology paper, two MCP/LLM-tooling papers (`10.48550_arxiv.2610.14334`, `10.48550_arxiv.2606.30317`), `The Computational Beauty of Nature` (an EmbedSkip on a Qdrant timeout), and the SIGGRAPH 2024/2026 and "Advances in Real-Time Rendering" notes again. No title matches ORCA, velocity obstacles, crowds, pedestrian dynamics, low-dimensional LP, spatial hashing, parallel stepping or grid outlines. `distill_search` is up (CUDA bge-m3, idle) and both scribe instances are healthy (2 and 5 converting, 803 queued). The solid-cells item (`docs/research/solid-cells.md`) found its technical sources by `distill_search` (listed under "Solid cells to outlines" below) and read Recast's `RecastContour.cpp` on GitHub.
+
+The scan before it, iteration 8's, as written then (its "Scanned last" is superseded by this one):
 Scanned last: iteration 8 (2026-10-31). `catalog_recent` (200 rows, 02:05-06:32 UTC) held nothing new in these domains: the same SIGGRAPH 2024/2026 papers and 2006-2025 "Advances in Real-Time Rendering" notes re-embedded, medical and psychology papers, two candle-flame physics papers, a forest-ecology paper, and `10.48550_arxiv.2512.04320` (VLCs) again. No title matches ORCA, velocity obstacles, crowds, pedestrian dynamics, low-dimensional LP, spatial hashing, wall or obstacle geometry. `distill_search` is up (CUDA bge-m3, idle), both scribe instances healthy (2 and 5 converting); the static-obstacles note (`docs/research/static-obstacles.md`) found its sources already indexed (`10.17815_cd.2016.1`, `gameaipro3-ch19-rvo-orca-how-they-really-work`, `10.1109_robot.2008.4543489`, `book_real_time_collision_detection_ericson`) and read the authors' ORCA PDF for section 5.4.
 
 The scan before it, iteration 7's, as written then (its "Scanned last" is superseded by this one):
@@ -70,6 +73,15 @@ Scanned last: iteration 5 (2026-10-30). `catalog_recent` (200 rows, 02:03–02:2
 - `book_geometric_tools_computer_graphics_schneider` p. 46 — cancellation and division by near-zero in the quadratic formula (the line–disc discriminant of `linear_program1`).
 - `10.1007_s10543-023-00975-x` — Bartels, Fisikopoulos & Weiser, "Fast floating-point filters for robust predicates", *BIT Numerical Mathematics* (catalog date 2022-07-31): round-off in geometric predicates. In the corpus (its abstract was read in iteration 7); not quoted by any note.
 - `book_real_time_collision_detection_ericson` ch. 11 also holds the worked cancellation example (a quadratic's discriminant in single precision) and "In many cases rewriting an expression can help avoid a cancellation error"; its plane equations give the point-normal form (`n · (X − P) = 0`, and "`|d|` equals the distance of the plane from the origin" for a unit `n`) that `speed-bound.md` stores a line in.
+
+## Solid cells to outlines (technical)
+
+Found in iteration 9 by `distill_search` for the solid-cells item; each is a home-still document unless marked GitHub.
+
+- `10.1609_icaps.v30i1.6654` — Hechenberger, Stuckey, Harabor, Le Bodic & Cheema, "Online Computation of Euclidean Shortest Paths in Two Dimensions", ICAPS 2020. A grid map's blocked cells are "traced to construct a set of inner-obstacles and enclosure", and "If two obstacles touch each other at a point … it is ambiguous if passing through this touching point is allowed or not".
+- `10.1080_2151237x.2011.563682` — Lengyel, voxel-terrain Marching Cubes in a shipped engine (Journal of Graphics, GPU and Game Tools): ambiguous faces, "the simplest solution, which is enforcing a fixed-edge polarity on ambiguous faces". `transvoxel_dissertation_lengyel2010` (his dissertation) has the same case in Fig. 3.2 and cites Nielson & Hamann 1991.
+- `10.1007_bf01900699` — "On generating topologically consistent isosurfaces from uniform samples", The Visual Computer 1991: the ambiguous cases, the 2-D analogue of a checkerboard of cells.
+- Recast `Recast/Source/RecastContour.cpp` (`recastnavigation/recastnavigation`, `main`; GitHub, read 2026-10-31): `walkContour`, the boundary walk over a cell grid with one fixed turning rule (`dir = (dir+1) & 0x3; // Rotate CW` at a border, `dir = (dir+3) & 0x3; // Rotate CCW` on a step), visited edges cleared (`flags[i] &= ~(1 << dir)`), then `simplifyContour` for the collinear vertices.
 
 ## Not in the corpus
 
