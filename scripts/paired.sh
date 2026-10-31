@@ -58,7 +58,10 @@ orca_b2 = { path = "orca_b2" }
 
 [workspace]
 TOML
-cp "$root/scripts/paired/main.rs" "$work/src/main.rs"
+# A base from before `CrowdMember::priority` has no such field to fill in; one after it does.
+base_fields=""
+if git -C "$root" show "$ref:src/crowd.rs" | grep -q 'pub priority: f32'; then base_fields=", priority: 1.0"; fi
+sed "s|/\*BASE_FIELDS\*/|$base_fields|" "$root/scripts/paired/main.rs" > "$work/src/main.rs"
 cp "$root/Cargo.lock" "$work/Cargo.lock"
 
 cd "$work"

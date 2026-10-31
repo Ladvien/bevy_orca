@@ -56,7 +56,7 @@
 //! builder.add_box(Vec2::ZERO, Vec2::new(4.0, 2.0)).expect("a box");
 //! let obstacles = builder.build().expect("one box");
 //!
-//! let agent = Agent { pos: Vec2::new(0.0, -3.0), vel: Vec2::Y, radius: 0.3, avoids: true };
+//! let agent = Agent { pos: Vec2::new(0.0, -3.0), vel: Vec2::Y, radius: 0.3, avoids: true, priority: 1.0 };
 //! let mut scratch = OrcaScratch::default();
 //! let mut walls = Vec::new();
 //! // Half a second of look-ahead against obstacles, at a top speed of 1.5: the hard lines, in the
@@ -1145,7 +1145,7 @@ mod tests {
         pref: Vec2,
         horizon: f32,
     ) -> (Vec<(Vec2, f32)>, Vec2) {
-        let agent = Agent { pos, vel, radius: 0.3, avoids: true };
+        let agent = Agent { pos, vel, radius: 0.3, avoids: true, priority: 1.0 };
         let mut scratch = OrcaScratch::default();
         let mut walls = Vec::new();
         obstacles.push_walls(&mut scratch, &agent, 1.5, horizon, &mut walls);
@@ -1330,7 +1330,7 @@ mod tests {
         let obstacles = built(|b| b.add_box(v(0.0, 0.0), v(1.0, 1.0)));
         let mut scratch = OrcaScratch::default();
         let mut walls = Vec::new();
-        let near = Agent { pos: v(2.0, 0.0), vel: Vec2::ZERO, radius: 0.3, avoids: true };
+        let near = Agent { pos: v(2.0, 0.0), vel: Vec2::ZERO, radius: 0.3, avoids: true, priority: 1.0 };
         obstacles.push_walls(&mut scratch, &near, 1.5, 1.0, &mut walls);
         assert_eq!(walls.len(), 1, "an agent 1 m from the face, 1.5 m of look-ahead");
         walls.clear();
@@ -1405,7 +1405,8 @@ mod tests {
             for _ in 0..200 {
                 let pos = offset + v(value(&mut counter, -50.0, 50.0), value(&mut counter, -50.0, 50.0));
                 let vel = v(value(&mut counter, -2.0, 2.0), value(&mut counter, -2.0, 2.0));
-                let agent = Agent { pos, vel, radius: value(&mut counter, 0.05, 0.6), avoids: true };
+                let agent =
+                    Agent { pos, vel, radius: value(&mut counter, 0.05, 0.6), avoids: true, priority: 1.0 };
                 let (speed, horizon) = (value(&mut counter, 0.5, 3.0), value(&mut counter, 0.2, 6.0));
                 let mut from_grid = Vec::new();
                 obstacles.push_walls(&mut scratch, &agent, speed, horizon, &mut from_grid);

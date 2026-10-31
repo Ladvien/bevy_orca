@@ -39,8 +39,15 @@ struct Outcome {
 /// situation the flag exists to describe, and solving for B anyway would quietly make it a cooperating
 /// agent that merely claimed not to be.
 fn run(offset: f32, b_avoids: bool, label: &str) -> Outcome {
-    let mut a = Agent { pos: Vec2::new(-4.0, offset), vel: Vec2::ZERO, radius: RADIUS, avoids: true };
-    let mut b = Agent { pos: Vec2::new(4.0, -offset), vel: Vec2::ZERO, radius: RADIUS, avoids: b_avoids };
+    let mut a =
+        Agent { pos: Vec2::new(-4.0, offset), vel: Vec2::ZERO, radius: RADIUS, avoids: true, priority: 1.0 };
+    let mut b = Agent {
+        pos: Vec2::new(4.0, -offset),
+        vel: Vec2::ZERO,
+        radius: RADIUS,
+        avoids: b_avoids,
+        priority: 1.0,
+    };
 
     let (goal_a, goal_b) = (Vec2::new(4.0, offset), Vec2::new(-4.0, -offset));
     let (mut peak_a, mut peak_b) = (0.0f32, 0.0f32);

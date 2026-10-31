@@ -74,7 +74,11 @@
 //! counts of the `threads>1` lines (default 2 and the machine's parallelism); `ORCA_OBST_HORIZON=s` sets
 //! `CrowdParams::obstacle_horizon` for the scenes that have obstacles; `ORCA_LANE=f` is the share of
 //! a city street's width its walkers' four lanes spread over (default 0.6, outer lanes 0.8 m from the
-//! brick; 1.0 puts them 0.2 m from it, which squeezes head-on pairs against the wall).
+//! brick; 1.0 puts them 0.2 m from it, which squeezes head-on pairs against the wall); `ORCA_PRIORITY=p`
+//! gives the members heading right (the goal, or a city walker's first leg, is to the right of the
+//! start) `CrowdMember::priority` `p` and everyone else 1, and prints a second line per `arrive` case,
+//! `arrive_priority`, with each stream's own arrived fraction, stalls and mean delay beyond the
+//! straight-line time (`ORCA_PRIORITY=1` is the control); unset, every priority is 1 and nothing changes.
 //!
 //! Run: `cargo run --release --example bench`
 
@@ -161,6 +165,13 @@ fn seed() -> u64 {
 /// such a lane meeting a head-on one has no room on its wall side to step aside.
 fn lane_share() -> f32 {
     std::env::var("ORCA_LANE").ok().and_then(|s| s.parse().ok()).unwrap_or(0.6)
+}
+
+/// `ORCA_PRIORITY`, the `CrowdMember::priority` of the stream heading right (the others keep 1.0), or
+/// `None` when it is not set. Setting it, even to `1`, also prints each stream's own arrival numbers
+/// (`arrive_priority`), so `ORCA_PRIORITY=1` is the control the other values are read against.
+fn high_priority() -> Option<f32> {
+    std::env::var("ORCA_PRIORITY").ok().and_then(|s| s.parse().ok())
 }
 
 /// The SplitMix64 output mix: the scenes' own stable pseudo-random numbers, drawn from a member's key.
@@ -343,6 +354,11 @@ struct World {
     /// The push-out city: agent-steps that ended inside a building, and the deepest of them.
     pushed: u64,
     push_max: f32,
+    /// Each agent's `CrowdMember::priority`: `ORCA_PRIORITY` for the stream heading right (its route's
+    /// or goal's x beyond its start), 1.0 for the rest, so a crowd that sets nothing is plain ORCA.
+    priority: Vec<f32>,
+    /// Whether the agent is in the stream `ORCA_PRIORITY` applies to.
+    high: Vec<bool>,
 }
 
 impl World {
@@ -504,6 +520,10 @@ impl World {
                 build_us = started.elapsed().as_secs_f64() * 1e6;
             }
         }
+        // The stream heading right, when there is one: a city walker's first leg is along its street.
+        let high: Vec<bool> =
+            (0..n).map(|a| (if scene.is_city() { route[a] } else { goal[a] }).x > pos[a].x).collect();
+        let hi = high_priority().unwrap_or(1.0);
         World {
             scene,
             vel: vec![Vec2::ZERO; n],
@@ -525,6 +545,8 @@ impl World {
             trips: false,
             pushed: 0,
             push_max: 0.0,
+            priority: high.iter().map(|&h| if h { hi } else { 1.0 }).collect(),
+            high,
         }
     }
 
@@ -721,6 +743,7 @@ impl World {
                 radius: RADIUS,
                 max_speed: SPEED,
                 pref_vel: Some(self.pref(a)),
+                priority: self.priority[a],
             });
         }
     }
@@ -1022,8 +1045,11 @@ fn arrive(scene: Scene, n: usize, metres_per_agent: f32) {
     let params = params_for(scene);
     let mut world = World::with_ring(scene, n, metres_per_agent);
     world.trips = true;
-    let longest = (0..n).map(|a| world.trip(a)).fold(0.0, f32::max);
+    let straight: Vec<f32> = (0..n).map(|a| world.trip(a)).collect();
+    let longest = straight.iter().copied().fold(0.0, f32::max);
     let steps = (3.0 * longest / SPEED / DT).ceil() as usize;
+    // The step each agent arrived on (0 = not yet), for the per-stream numbers `ORCA_PRIORITY` asks for.
+    let mut arrived_on = vec![0usize; n];
     let mut crowd = Crowd::default();
     let (mut members, mut slots, mut out) = (Vec::new(), Vec::new(), Vec::new());
     let mut check_grid = Grid::default();
@@ -1051,6 +1077,11 @@ fn arrive(scene: Scene, n: usize, metres_per_agent: f32) {
         out.extend_from_slice(solved);
         speed_max = speed_max.max(speed_ratio(&members, &out));
         world.advance(&slots, &out);
+        for (a, on) in arrived_on.iter_mut().enumerate() {
+            if *on == 0 && world.gone[a] {
+                *on = step + 1;
+            }
+        }
         overlap_max = overlap_max.max(world.deepest_overlap(&mut check_grid));
         for a in 0..n {
             if !world.gone[a] {
@@ -1088,6 +1119,27 @@ fn arrive(scene: Scene, n: usize, metres_per_agent: f32) {
         wall_max,
         state_hash(&world.pos, &world.vel),
     );
+    if let Some(priority) = high_priority() {
+        // Each stream on its own: how many of it arrived, stalled, and how long the arrivals took beyond
+        // the straight-line time (`delay_s`, the mean over those that arrived).
+        let stream = |wanted: bool| {
+            let members: Vec<usize> = (0..n).filter(|&a| world.high[a] == wanted).collect();
+            let done: Vec<usize> = members.iter().copied().filter(|&a| arrived_on[a] != 0).collect();
+            let delay =
+                done.iter().map(|&a| f64::from(arrived_on[a] as f32 * DT - straight[a] / SPEED)).sum::<f64>()
+                    / done.len().max(1) as f64;
+            let stalled = members.iter().filter(|&&a| world.stalled[a]).count();
+            (members.len(), done.len() as f64 / members.len().max(1) as f64, stalled, delay)
+        };
+        let (high, high_arrived, high_stalled, high_delay) = stream(true);
+        let (low, low_arrived, low_stalled, low_delay) = stream(false);
+        println!(
+            "orca: arrive_priority {} agents={n} priority={priority} high={high} low={low} \
+             arrived_high={high_arrived:.3} arrived_low={low_arrived:.3} stalled_high={high_stalled} \
+             stalled_low={low_stalled} delay_high_s={high_delay:.3} delay_low_s={low_delay:.3}",
+            scene.name(),
+        );
+    }
 }
 
 fn main() {
