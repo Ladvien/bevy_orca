@@ -146,8 +146,10 @@ fn thread_cpu() -> Duration {
 }
 
 /// One module per copy of the crate: its own `Crowd`, its own member type, the scene converted once.
+/// The fields after the crate are the copy's own extras for `CrowdMember`: a copy whose crate has no
+/// `priority` yet (a base from before it) gets none, and the others get `priority: 1.0`.
 macro_rules! copy {
-    ($module:ident, $krate:ident) => {
+    ($module:ident, $krate:ident $(, $field:ident : $value:expr)*) => {
         mod $module {
             use super::{DT, Frozen, RADIUS, SPEED, Scene, thread_cpu};
             use bevy_math::Vec2;
@@ -172,6 +174,7 @@ macro_rules! copy {
                             radius: RADIUS,
                             max_speed: SPEED,
                             pref_vel: Some(f.wish),
+                            $($field: $value,)*
                         })
                         .collect();
                     let mut case = Case {
@@ -212,10 +215,11 @@ macro_rules! copy {
     };
 }
 
-copy!(a1, orca_a1);
-copy!(a2, orca_a2);
-copy!(b1, orca_b1);
-copy!(b2, orca_b2);
+// `BASE_FIELDS` is replaced by `scripts/paired.sh` (empty, or `, priority: 1.0` when the base has it).
+copy!(a1, orca_a1 /*BASE_FIELDS*/);
+copy!(a2, orca_a2 /*BASE_FIELDS*/);
+copy!(b1, orca_b1, priority: 1.0);
+copy!(b2, orca_b2, priority: 1.0);
 
 fn median(mut v: Vec<f64>) -> f64 {
     v.sort_by(f64::total_cmp);

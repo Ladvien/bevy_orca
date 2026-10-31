@@ -46,9 +46,10 @@ const EPSILON: f32 = 1.0e-5;
 /// A disc agent in the xz ground plane (y dropped): position, current velocity, radius.
 ///
 /// `avoids` is whether this agent is *also* running avoidance this step. When a neighbor avoids
-/// too (another commanded unit), the pair splits the avoidance 50/50 (reciprocity). When it does
-/// not (an idle unit holding ground), the moving agent takes the **full** avoidance so the idle
-/// unit isn't assumed to step aside and get walked through.
+/// too (another commanded unit), the pair splits the avoidance (reciprocity): evenly, unless their
+/// [`priority`](Self::priority) differs. When it does not (an idle unit holding ground), the moving
+/// agent takes the **full** avoidance so the idle unit isn't assumed to step aside and get walked
+/// through.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect))]
@@ -57,12 +58,40 @@ pub struct Agent {
     pub vel: Vec2,
     pub radius: f32,
     pub avoids: bool,
+    /// Right of way against a neighbour that also avoids: a ratio, so only comparisons mean anything.
+    /// Of the dodge a collision course asks for, this agent takes `other / (this + other)` and the
+    /// neighbour takes the rest, so the two shares add to 1 (the condition the collision-free
+    /// guarantee needs) and both sides compute them from the same two numbers. Equal priorities are
+    /// ORCA's even half; `3` against `1` takes a quarter and leaves the neighbour three quarters;
+    /// `0` against anything above it takes all of it, and `∞` against anything finite takes none.
+    /// A NaN or negative priority counts as `0`: the member gives way and never pushes harder.
+    /// A neighbour with `avoids: false` is avoided in full whatever its priority, and walls always
+    /// are. `1.0` is the default and, for a crowd that never changes it, plain ORCA.
+    pub priority: f32,
 }
 
 impl Default for Agent {
     fn default() -> Self {
-        Self { pos: Vec2::ZERO, vel: Vec2::ZERO, radius: 0.0, avoids: false }
+        Self { pos: Vec2::ZERO, vel: Vec2::ZERO, radius: 0.0, avoids: false, priority: 1.0 }
     }
+}
+
+/// The share of an avoidance an agent of priority `own` takes against a neighbour of priority
+/// `other`, both of which step aside: `other / (own + other)`, so the pair's two shares add to 1.
+///
+/// Written as `1 / (1 + own / other)` because the sum overflows for two huge priorities and
+/// `∞ / (∞ + x)` is NaN, where the ratio is `0`, finite or `∞` for every unequal pair; the two
+/// equal-priority cases whose ratio would be NaN (`0 / 0`, `∞ / ∞`) are caught first and are the
+/// plain half, which also keeps a crowd that never sets a priority on exactly the `0.5` it had.
+/// `f32::max` ignores a NaN, so a priority that is NaN or negative becomes `0`.
+///
+/// The A* Pathfinding Project ships `other.priority / (this.priority + other.priority)`, and RVO's
+/// generalised obstacle (van den Berg, Lin & Manocha, ICRA 2008, §III-C) asks only that the two
+/// shares add to 1.
+#[inline]
+pub(crate) fn share(own: f32, other: f32) -> f32 {
+    let (own, other) = (own.max(0.0), other.max(0.0));
+    if own == other { 0.5 } else { 1.0 / (1.0 + own / other) }
 }
 
 /// A half-plane constraint `{ v : det(direction, v - point) >= 0 }` on the new velocity.
@@ -216,6 +245,10 @@ pub fn new_velocity(
 /// - a neighbour whose `pos` or `vel` is not finite, or whose `radius` is negative or not finite, is
 ///   skipped: it has no velocity obstacle. So is one whose constraint overflows `f32` relative to this
 ///   agent (agents near `±f32::MAX`), as if it were out of range.
+/// - a `priority` that is NaN or negative, the agent's own or a neighbour's, counts as `0` (see
+///   [`Agent::priority`]): that agent gives way, and no neighbour is ever skipped for it. An agent
+///   whose `priority` is `∞` against a finite one takes none of the avoidance; the answer is still
+///   finite.
 ///
 /// A `radius` of `0` is a point, and usable. So is any finite `pref_vel`, including one too long to
 /// square (above about `1.8e19`): it is clamped to the speed disc along its own direction. Finite,
@@ -353,9 +386,10 @@ pub fn new_velocity_in(
             u = (combined_radius * inv_dt - w_length) * unit_w;
         }
 
-        // Reciprocity: split the change with neighbors that also avoid; take it all against ones
-        // that don't (idle units holding ground).
-        let responsibility = if other.avoids { 0.5 } else { 1.0 };
+        // Reciprocity: split the change with neighbors that also avoid, by right of way (evenly when
+        // the two priorities are equal); take it all against ones that don't (idle units holding
+        // ground), whatever their priority.
+        let responsibility = if other.avoids { share(agent.priority, other.priority) } else { 1.0 };
         let point = agent.vel + responsibility * u;
         // Stored at its point nearest the origin, so a constraint built from a fast own velocity does
         // not carry that speed into the disc test. Finite input can still overflow `f32` (two agents
@@ -542,7 +576,7 @@ mod tests {
     use super::*;
 
     fn agent(pos: Vec2, vel: Vec2) -> Agent {
-        Agent { pos, vel, radius: 0.5, avoids: true }
+        Agent { pos, vel, radius: 0.5, avoids: true, priority: 1.0 }
     }
 
     /// A deterministic `u32 -> [0,1)` hash (PCG-style output mix), inlined here so the sweep below
@@ -679,18 +713,21 @@ mod tests {
             vel: Vec2::new(0.56427115, -0.2730432),
             radius: 0.5298626,
             avoids: true,
+            priority: 1.0,
         };
         let holding = Agent {
             pos: Vec2::new(-0.5121927, 4.374553),
             vel: Vec2::new(0.7615271, 0.7948744),
             radius: 0.54053575,
             avoids: false,
+            priority: 1.0,
         };
         let stepping_aside = Agent {
             pos: Vec2::new(0.058371365, 1.7260351),
             vel: Vec2::new(0.04875728, -1.309605),
             radius: 0.48520732,
             avoids: true,
+            priority: 1.0,
         };
         let max_speed = 1.6848793_f32;
         let v = new_velocity(
@@ -738,6 +775,7 @@ mod tests {
                 vel: Vec2::from_angle(TAU * next()) * own_speed,
                 radius: 0.2 + 0.4 * next(),
                 avoids: true,
+                priority: 1.0,
             };
             neighbours.clear();
             for k in 0..(13.0 * next()) as usize {
@@ -751,6 +789,7 @@ mod tests {
                     vel: Vec2::from_angle(TAU * next()) * 2.0 * next(),
                     radius: 0.2 + 0.4 * next(),
                     avoids: next() < 0.7,
+                    priority: 1.0,
                 });
             }
             walls.clear();
@@ -964,7 +1003,7 @@ mod tests {
 
     /// The property the whole crate promises a host: whatever it hands in — every field of the agent,
     /// its neighbours and walls, and every scalar — the answer is a finite velocity and never a panic.
-    /// Each case makes one field hostile, or (every seventeenth case) any field with a 30% chance.
+    /// Each case makes one field hostile, or (every nineteenth case, the 16th) any field with a 30% chance.
     #[test]
     fn hostile_input_never_gives_a_non_finite_velocity() {
         let mut scratch = OrcaScratch::default();
@@ -974,7 +1013,7 @@ mod tests {
             hash_f32(seed.wrapping_mul(0x9E37_79B1))
         };
         for case in 0..20_000u32 {
-            let which = case % 17;
+            let which = case % 19;
             let chaos = which == 16;
             let take = |field: u32, sane: f32, roll: f32, pick: f32| -> f32 {
                 if which == field || (chaos && roll < 0.3) {
@@ -992,6 +1031,7 @@ mod tests {
                 vel: Vec2::new(field(2, -2.0, 2.0), field(3, -2.0, 2.0)),
                 radius: field(4, 0.2, 0.6),
                 avoids: true,
+                priority: field(18, 0.1, 4.0),
             };
             let mut neighbours = [Agent::default(); 4];
             for (k, n) in neighbours.iter_mut().enumerate() {
@@ -1001,6 +1041,7 @@ mod tests {
                     vel: Vec2::new(field(7, -2.0, 2.0), field(7, -2.0, 2.0)),
                     radius: field(8, 0.2, 0.6),
                     avoids: k % 2 == 0,
+                    priority: field(18, 0.1, 4.0),
                 };
                 // Coincident agents: the exact degenerate the overlapping branch divides by.
                 if which == 9 && k < 2 {

@@ -20,6 +20,7 @@ fn block(n: usize) -> Vec<CrowdMember> {
             radius: 0.3,
             max_speed: 1.3,
             pref_vel: Some(Vec2::X),
+            priority: 1.0,
         })
         .collect()
 }
