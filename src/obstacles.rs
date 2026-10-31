@@ -29,7 +29,10 @@
 //!   solid (a room, a courtyard, the edge of the map);
 //! - [`add_wall`](ObstaclesBuilder::add_wall): a wall with no thickness, solid to neither side and
 //!   passable from neither;
-//! - [`add_box`](ObstaclesBuilder::add_box): an axis-aligned solid rectangle.
+//! - [`add_box`](ObstaclesBuilder::add_box): an axis-aligned solid rectangle;
+//! - [`add_cells`](ObstaclesBuilder::add_cells): a grid of solid cells, the way a tile map holds
+//!   them, traced into the outline of each region of solid cells (a wall of any length is one edge,
+//!   a block of cells is the four edges of [`add_box`](ObstaclesBuilder::add_box)).
 //!
 //! Obstacles do not make an agent go around them: the direction round a building is the agent's
 //! preferred velocity, from whatever global navigator the host has (ORCA paper, section 5.4).
@@ -64,6 +67,8 @@
 //! assert!((v.y - 1.4).abs() < 1.0e-4 && v.x.abs() < 1.0e-4);
 //! ```
 
+use std::collections::BTreeMap;
+
 use bevy_math::Vec2;
 
 use crate::{Agent, EPSILON, OrcaScratch, det, usable_speed, usable_state};
@@ -96,6 +101,9 @@ pub enum ObstacleError {
     SelfIntersecting,
     /// More than 2^26 vertices.
     TooMany,
+    /// The grid given to [`ObstaclesBuilder::add_cells`] is not a grid: no `width` for cells, a
+    /// number of cells that is not a multiple of `width`, or a `cell_size` that is not positive.
+    BadGrid,
 }
 
 impl core::fmt::Display for ObstacleError {
@@ -108,6 +116,7 @@ impl core::fmt::Display for ObstacleError {
             ObstacleError::ZeroArea => "the polygon encloses no area",
             ObstacleError::SelfIntersecting => "two edges of one polygon cross or touch",
             ObstacleError::TooMany => "more than 2^26 vertices",
+            ObstacleError::BadGrid => "a cell grid needs a positive cell size and whole rows of cells",
         })
     }
 }
@@ -189,6 +198,81 @@ impl ObstaclesBuilder {
             centre + Vec2::new(-h.x, h.y),
         ];
         self.add_solid(&corners)
+    }
+
+    /// A grid of solid cells, as a tile map or a flow-field's cost grid holds them, traced into the
+    /// outline of each region of solid cells.
+    ///
+    /// `solid[row * width + column]` says whether the square cell `column` cells along `+x` and
+    /// `row` along `+y` of `origin` is solid, `origin` being the lower-left corner of cell
+    /// `(0, 0)` and `cell_size` the side of a cell, in the host's units; the grid is `width` cells
+    /// wide and `solid.len() / width` high. **Outside the grid is open floor**: to make the edge of
+    /// the map a wall, pad the grid with solid cells or add the map's rectangle with
+    /// [`add_enclosure`](Self::add_enclosure).
+    ///
+    /// What is added is the boundary of the solid region, once: a polygon per region of cells that
+    /// share an edge, and a hole (an enclosure) per pocket of open floor inside one, with every
+    /// straight run of cells a single edge. A block of cells is the four edges
+    /// [`add_box`](Self::add_box) gives it, and a 1 000 × 1 000 map is built in a few milliseconds
+    /// and a few hundred edges where one box per cell is four edges for every cell however deep in
+    /// a wall. Two solid cells that meet only at a corner are two polygons that touch there, never
+    /// one polygon that crosses itself: no disc passes through a point, so the gap between them is
+    /// shut.
+    ///
+    /// No cell is solid means nothing is added, and an empty grid (no `width` and no cells) is fine.
+    /// A `width` of 0 for a grid that has cells, a number of cells that is not a multiple of
+    /// `width`, or a `cell_size` that is not positive is [`ObstacleError::BadGrid`]; a non-finite
+    /// `origin` or `cell_size` is [`ObstacleError::NotFinite`]; a corner beyond `1e18` is
+    /// [`ObstacleError::OutOfRange`]. An error leaves the builder as it was.
+    ///
+    /// ```
+    /// use bevy_math::Vec2;
+    /// use bevy_orca::ObstaclesBuilder;
+    ///
+    /// // A 5 × 4 map, 2 m cells: a room's four walls (a ring of solid cells around a 3 × 2 floor).
+    /// let (w, h) = (5, 4);
+    /// let solid: Vec<bool> =
+    ///     (0..w * h).map(|i| (i % w == 0) || (i % w == w - 1) || (i / w == 0) || (i / w == h - 1)).collect();
+    /// let mut builder = ObstaclesBuilder::new();
+    /// builder.add_cells(Vec2::ZERO, 2.0, w, &solid).expect("a grid");
+    /// let obstacles = builder.build().expect("a room");
+    /// // 14 solid cells, but the outside of the ring is one polygon (4 edges) and the floor inside it
+    /// // is one hole (4 edges).
+    /// assert_eq!(obstacles.len(), 8);
+    /// ```
+    pub fn add_cells(
+        &mut self,
+        origin: Vec2,
+        cell_size: f32,
+        width: usize,
+        solid: &[bool],
+    ) -> Result<&mut Self, ObstacleError> {
+        if !(origin.is_finite() && cell_size.is_finite()) {
+            return Err(ObstacleError::NotFinite);
+        }
+        if cell_size <= 0.0 || (width == 0 && !solid.is_empty()) || (width != 0 && solid.len() % width != 0) {
+            return Err(ObstacleError::BadGrid);
+        }
+        let (vertices, rings) = (self.vertices.len(), self.rings.len());
+        let (ox, oy, size) = (f64::from(origin.x), f64::from(origin.y), f64::from(cell_size));
+        let mut points: Vec<Vec2> = Vec::new();
+        let traced = trace_cells(width, solid, |corners, area| {
+            points.clear();
+            points.extend(
+                corners
+                    .iter()
+                    .map(|&(x, y)| Vec2::new((ox + x as f64 * size) as f32, (oy + y as f64 * size) as f32)),
+            );
+            // A positive area is the outside of a region of solid cells, a negative one a pocket of
+            // open floor inside it: the same two things `add_solid` and `add_enclosure` say.
+            if area > 0 { self.add_solid(&points) } else { self.add_enclosure(&points) }.map(|_| ())
+        });
+        if let Err(error) = traced {
+            self.vertices.truncate(vertices);
+            self.rings.truncate(rings);
+            return Err(error);
+        }
+        Ok(self)
     }
 
     /// Appends the polygon `ring`, reversed if `reverse`, after checking it. Two vertices are a wall.
@@ -274,6 +358,166 @@ fn ring_area(ring: &[Vec2]) -> Result<f64, ObstacleError> {
         return Err(ObstacleError::ZeroArea);
     }
     Ok(area)
+}
+
+/// The four directions of a lattice edge, counter-clockwise from east, as `(dx, dy)`.
+const STEPS: [(i64, i64); 4] = [(1, 0), (0, 1), (-1, 0), (0, -1)];
+
+/// The outline of the solid cells of a `width`-wide grid, as loops of lattice corners, handed to
+/// `emit` one at a time with the loop's doubled signed area (positive for a counter-clockwise loop,
+/// the outside of a region; negative for a clockwise one, a pocket of open floor inside it).
+///
+/// Every boundary between a solid cell and open floor (the grid's edge is open) is a unit lattice edge
+/// directed so that the solid is on its left, and every lattice vertex keeps the set of those that
+/// leave it. Loops are walked from the first vertex in row-major order that still has an edge,
+/// each edge used once, and at every vertex the walk takes the leftmost unused edge (left, then
+/// straight, then right), the one fixed rule Recast's `walkContour` also walks a region of cells by.
+/// Corners are the only vertices kept, so a straight wall is one edge.
+///
+/// A vertex with two edges leaving it is a *pinch*: two solid cells meet there only at a corner
+/// (a checkerboard), and the walk takes the pairing that keeps each cell's own boundary. When the
+/// two cells are one region joined elsewhere the walk then comes to the pinch twice in one loop,
+/// which would be a polygon that touches itself, so such a loop is cut there into the loops it is
+/// made of: an outside and the pocket of open floor it pinches off, or the two halves of a figure
+/// eight. Every loop emitted visits each vertex once.
+///
+/// `solid` is row-major, `width` cells to a row, and its length a multiple of `width`.
+fn trace_cells(
+    width: usize,
+    solid: &[bool],
+    mut emit: impl FnMut(&[(i64, i64)], i128) -> Result<(), ObstacleError>,
+) -> Result<(), ObstacleError> {
+    if width == 0 || !solid.iter().any(|&cell| cell) {
+        return Ok(());
+    }
+    let height = solid.len() / width;
+    let stride = width + 1;
+    // One byte per lattice vertex: bit `d` is set when a boundary edge leaves it in direction `d`.
+    let mut leaving = vec![0u8; stride * (height + 1)];
+    let open = |column: usize, row: usize, dx: i64, dy: i64| {
+        let (c, r) = (column as i64 + dx, row as i64 + dy);
+        let inside = c >= 0 && r >= 0 && (c as usize) < width && (r as usize) < height;
+        !(inside && solid.get(r as usize * width + c as usize).copied().unwrap_or(false))
+    };
+    for (row, cells) in solid.chunks_exact(width).enumerate() {
+        for (column, &cell) in cells.iter().enumerate() {
+            if !cell {
+                continue;
+            }
+            // South side: east along it; east side: north; north side: west; west side: south.
+            for (neighbour, corner, direction) in [
+                ((0, -1), (column, row), 0u8),
+                ((1, 0), (column + 1, row), 1),
+                ((0, 1), (column + 1, row + 1), 2),
+                ((-1, 0), (column, row + 1), 3),
+            ] {
+                if open(column, row, neighbour.0, neighbour.1)
+                    && let Some(bits) = leaving.get_mut(corner.1 * stride + corner.0)
+                {
+                    *bits |= 1 << direction;
+                }
+            }
+        }
+    }
+    // The pinches, in order: only these vertices can be visited twice by one walk.
+    let pinches: Vec<usize> =
+        leaving.iter().enumerate().filter(|(_, bits)| bits.count_ones() > 1).map(|(i, _)| i).collect();
+
+    let mut walk: Vec<(i64, i64)> = Vec::new();
+    let mut corners: Vec<(i64, i64)> = Vec::new();
+    for start in 0..leaving.len() {
+        while let Some(&bits) = leaving.get(start)
+            && bits != 0
+        {
+            let first = bits.trailing_zeros() as usize;
+            let (mut x, mut y) = ((start % stride) as i64, (start / stride) as i64);
+            let mut direction = first;
+            walk.clear();
+            loop {
+                walk.push((x, y));
+                let here = y as usize * stride + x as usize;
+                if (here, direction) != (start, first)
+                    && let Some(bits) = leaving.get_mut(here)
+                {
+                    *bits &= !(1 << direction);
+                }
+                let (dx, dy) = STEPS.get(direction).copied().unwrap_or((0, 0));
+                (x, y) = (x + dx, y + dy);
+                let there = y as usize * stride + x as usize;
+                let available = leaving.get(there).copied().unwrap_or(0);
+                let Some(next) = [(direction + 1) % 4, direction, (direction + 3) % 4]
+                    .into_iter()
+                    .find(|&d| available & (1 << d) != 0)
+                else {
+                    break;
+                };
+                if there == start && next == first {
+                    break;
+                }
+                direction = next;
+            }
+            if let Some(bits) = leaving.get_mut(start) {
+                *bits &= !(1 << first);
+            }
+
+            // Keep the corners: the vertices where the loop turns.
+            let n = walk.len();
+            let before = walk.iter().cycle().skip(n - 1);
+            let after = walk.iter().cycle().skip(1);
+            corners.clear();
+            corners.extend(
+                before.zip(walk.iter()).zip(after).filter_map(|((p, c), a)| {
+                    ((c.0 - p.0, c.1 - p.1) != (a.0 - c.0, a.1 - c.1)).then_some(*c)
+                }),
+            );
+            emit_loops(&corners, stride, &pinches, &mut emit)?;
+        }
+    }
+    Ok(())
+}
+
+/// Twice the signed area of a loop of lattice corners: positive when it runs counter-clockwise.
+fn doubled_area(corners: &[(i64, i64)]) -> i128 {
+    let next = corners.iter().cycle().skip(1);
+    corners
+        .iter()
+        .zip(next)
+        .map(|(a, b)| i128::from(a.0) * i128::from(b.1) - i128::from(b.0) * i128::from(a.1))
+        .sum()
+}
+
+/// Hands `emit` the loop `corners`, or, when it passes a pinch vertex twice (see [`trace_cells`]), the
+/// loops it is made of, each cut out at the vertex it came back to. `pinches` are the lattice
+/// vertices (`y * stride + x`) that can repeat, sorted.
+fn emit_loops(
+    corners: &[(i64, i64)],
+    stride: usize,
+    pinches: &[usize],
+    emit: &mut impl FnMut(&[(i64, i64)], i128) -> Result<(), ObstacleError>,
+) -> Result<(), ObstacleError> {
+    let is_pinch = |c: &(i64, i64)| pinches.binary_search(&(c.1 as usize * stride + c.0 as usize)).is_ok();
+    if !corners.iter().any(is_pinch) {
+        return emit(corners, doubled_area(corners));
+    }
+    // The loop so far, and where each pinch on it is. Coming back to one closes a loop of its own.
+    let mut path: Vec<(i64, i64)> = Vec::new();
+    let mut on_path: BTreeMap<(i64, i64), usize> = BTreeMap::new();
+    for &corner in corners {
+        if !is_pinch(&corner) {
+            path.push(corner);
+        } else if let Some(&first) = on_path.get(&corner) {
+            let mut closed = vec![corner];
+            closed.extend(path.split_off(first + 1));
+            for gone in closed.iter().skip(1) {
+                on_path.remove(gone);
+            }
+            emit(&closed, doubled_area(&closed))?;
+        } else {
+            on_path.insert(corner, path.len());
+            path.push(corner);
+        }
+    }
+    emit(&path, doubled_area(&path))
 }
 
 /// A set of static obstacles, indexed for a query per agent. Build one with [`ObstaclesBuilder`]; it
@@ -1206,5 +1450,206 @@ mod tests {
             let (walls, _) = solve(&obstacles, v(0.5, y), Vec2::ZERO, v(-1.5, 0.0), 2.0);
             assert!(!walls.is_empty(), "no line for a walker 0.5 m beside the wall at y = {y}");
         }
+    }
+
+    /// A random grid: `width × height` cells, each solid with probability `fill`.
+    fn random_cells(counter: &mut u64, width: usize, height: usize, fill: f32) -> Vec<bool> {
+        (0..width * height).map(|_| value(counter, 0.0, 1.0) < fill).collect()
+    }
+
+    /// The boundary of the solid region, the slow obvious way: for every solid cell and each of its
+    /// four sides with open floor (or the edge of the grid) beyond it, the unit lattice edge along that
+    /// side with the solid on its left. Sorted.
+    fn boundary_edges(width: usize, solid: &[bool]) -> Vec<((i64, i64), (i64, i64))> {
+        let height = (solid.len() / width.max(1)) as i64;
+        let at = |c: i64, r: i64| {
+            c >= 0 && r >= 0 && c < width as i64 && r < height && solid[(r * width as i64 + c) as usize]
+        };
+        let mut edges = Vec::new();
+        for r in 0..height {
+            for c in 0..width as i64 {
+                if !at(c, r) {
+                    continue;
+                }
+                if !at(c, r - 1) {
+                    edges.push(((c, r), (c + 1, r)));
+                }
+                if !at(c + 1, r) {
+                    edges.push(((c + 1, r), (c + 1, r + 1)));
+                }
+                if !at(c, r + 1) {
+                    edges.push(((c + 1, r + 1), (c, r + 1)));
+                }
+                if !at(c - 1, r) {
+                    edges.push(((c, r + 1), (c, r)));
+                }
+            }
+        }
+        edges.sort_unstable();
+        edges
+    }
+
+    /// Every loop `trace_cells` emits, as `(corners, doubled signed area)`.
+    fn traced(width: usize, solid: &[bool]) -> Vec<(Vec<(i64, i64)>, i128)> {
+        let mut loops = Vec::new();
+        trace_cells(width, solid, |corners, area| {
+            loops.push((corners.to_vec(), area));
+            Ok(())
+        })
+        .expect("tracing cannot fail");
+        loops
+    }
+
+    /// The outline of any grid is exactly the boundary of its solid region: every boundary edge once,
+    /// directed with the solid on its left, and no other; loops are closed, every vertex of one is a
+    /// real corner and none repeats, and the loops' signed areas (outsides positive, pockets
+    /// negative) add up to the solid's.
+    #[test]
+    fn the_outline_of_a_grid_is_exactly_its_boundary() {
+        let mut counter = 0u64;
+        let mut checkerboards = 0usize;
+        for scene in 0..4000usize {
+            let (width, height) = (1 + scene % 13, 1 + (scene / 13) % 11);
+            let fill = [0.05, 0.2, 0.35, 0.5, 0.5, 0.65, 0.8, 0.95][scene % 8];
+            let solid = random_cells(&mut counter, width, height, fill);
+            let loops = traced(width, &solid);
+
+            let mut edges = Vec::new();
+            let mut area = 0i128;
+            for (corners, doubled) in &loops {
+                let n = corners.len();
+                assert!(
+                    n >= 4 && n % 2 == 0,
+                    "a rectilinear loop has an even number of corners, at least four"
+                );
+                let mut seen = corners.clone();
+                seen.sort_unstable();
+                seen.dedup();
+                assert_eq!(
+                    seen.len(),
+                    n,
+                    "a loop revisited a vertex: {corners:?} in {solid:?} ({width} wide)"
+                );
+                for i in 0..n {
+                    let (a, b, c) = (corners[i], corners[(i + 1) % n], corners[(i + 2) % n]);
+                    let (d1, d2) = ((b.0 - a.0, b.1 - a.1), (c.0 - b.0, c.1 - b.1));
+                    assert!(d1.0 == 0 || d1.1 == 0, "a diagonal edge");
+                    assert!(d1.0 * d2.1 - d1.1 * d2.0 != 0, "a vertex that is not a turn");
+                    let steps = (d1.0.abs() + d1.1.abs()).max(1);
+                    let unit = (d1.0.signum(), d1.1.signum());
+                    for k in 0..steps {
+                        edges.push((
+                            (a.0 + unit.0 * k, a.1 + unit.1 * k),
+                            (a.0 + unit.0 * (k + 1), a.1 + unit.1 * (k + 1)),
+                        ));
+                    }
+                }
+                area += doubled;
+            }
+            edges.sort_unstable();
+            assert_eq!(edges, boundary_edges(width, &solid), "{solid:?}, {width} wide");
+            let cells = solid.iter().filter(|&&s| s).count() as i128;
+            assert_eq!(area, 2 * cells, "the loops' areas are not the solid's: {solid:?}, {width} wide");
+            checkerboards += (0..solid.len())
+                .filter(|&i| {
+                    let (c, r) = (i % width, i / width);
+                    c + 1 < width
+                        && r + 1 < height
+                        && solid[i]
+                        && solid[i + width + 1]
+                        && !solid[i + 1]
+                        && !solid[i + width]
+                })
+                .count();
+        }
+        assert!(checkerboards > 1000, "the sweep must contain corner contacts: {checkerboards}");
+    }
+
+    /// Cells that meet only at a corner are separate loops that touch there, in either diagonal, and
+    /// four around a hole are four loops, not one loop that touches itself.
+    #[test]
+    fn solid_cells_that_meet_only_at_a_corner_are_separate_loops() {
+        for solid in [[true, false, false, true], [false, true, true, false]] {
+            let loops = traced(2, &solid);
+            assert_eq!(loops.len(), 2, "{solid:?}");
+            assert!(loops.iter().all(|(corners, area)| corners.len() == 4 && *area == 2));
+        }
+        let diamond = [false, true, false, true, false, true, false, true, false];
+        let loops = traced(3, &diamond);
+        assert_eq!(loops.len(), 4);
+        assert!(loops.iter().all(|(corners, area)| corners.len() == 4 && *area == 2));
+    }
+
+    /// Every grid builds: the polygons that come out of the tracer are never refused as crossing
+    /// themselves, whatever corners the cells meet at, and the set has one edge per corner.
+    #[test]
+    fn every_grid_builds() {
+        let mut counter = 7u64;
+        for scene in 0..3000usize {
+            let (width, height) = (1 + scene % 17, 1 + (scene / 17) % 15);
+            let fill = [0.1, 0.3, 0.5, 0.5, 0.7, 0.9][scene % 6];
+            let solid = random_cells(&mut counter, width, height, fill);
+            let origin = v(value(&mut counter, -50.0, 50.0), value(&mut counter, -50.0, 50.0));
+            let size = value(&mut counter, 0.25, 3.0);
+            let corners: usize = traced(width, &solid).iter().map(|(c, _)| c.len()).sum();
+            let mut builder = ObstaclesBuilder::new();
+            builder.add_cells(origin, size, width, &solid).expect("a grid");
+            let obstacles =
+                builder.build().unwrap_or_else(|e| panic!("{e}: {solid:?}, {width} wide, size {size}"));
+            assert_eq!(obstacles.len(), corners);
+        }
+    }
+
+    /// A straight wall is one edge however many cells make it, a block of cells is a box's four, and an
+    /// L, a ring and a room each have the corners they have.
+    #[test]
+    fn an_outline_has_a_corner_per_turn_and_no_more() {
+        let edges =
+            |width: usize, solid: &[bool]| built(|b| b.add_cells(Vec2::ZERO, 1.0, width, solid)).len();
+        let wall: Vec<bool> = (0..3000).map(|i| i / 1000 == 1).collect();
+        assert_eq!(edges(1000, &wall), 4, "a wall 1000 cells long");
+        let block: Vec<bool> =
+            (0..9 * 6).map(|i| (2..7).contains(&(i % 9)) && (1..4).contains(&(i / 9))).collect();
+        assert_eq!(edges(9, &block), 4, "a 5 x 3 block");
+        let l = [true, true, true, true, false, false, true, false, false];
+        assert_eq!(edges(3, &l), 6, "an L of cells");
+        let ring = [true, true, true, true, false, true, true, true, true];
+        assert_eq!(edges(3, &ring), 8, "a ring of cells: its outside and its pocket");
+        assert_eq!(edges(3, &[false; 9]), 0);
+        assert_eq!(edges(3, &[true; 9]), 4, "a block of solid cells filling the whole grid");
+        assert_eq!(edges(1, &[true]), 4, "a single cell");
+    }
+
+    /// What is not a grid is refused with the reason, and the builder is left as it was.
+    #[test]
+    fn add_cells_refuses_what_is_not_a_grid() {
+        let mut b = ObstaclesBuilder::new();
+        b.add_box(v(0.0, 0.0), v(1.0, 1.0)).expect("a box");
+        let solid = [true, false, true, true, true, false];
+        let nan = f32::NAN;
+        assert_eq!(b.add_cells(Vec2::ZERO, 1.0, 0, &solid).err(), Some(ObstacleError::BadGrid));
+        assert_eq!(b.add_cells(Vec2::ZERO, 1.0, 4, &solid).err(), Some(ObstacleError::BadGrid));
+        for size in [0.0, -1.0, -0.0] {
+            assert_eq!(
+                b.add_cells(Vec2::ZERO, size, 3, &solid).err(),
+                Some(ObstacleError::BadGrid),
+                "{size}"
+            );
+        }
+        for (origin, size) in
+            [(v(nan, 0.0), 1.0), (v(0.0, f32::INFINITY), 1.0), (Vec2::ZERO, nan), (Vec2::ZERO, f32::INFINITY)]
+        {
+            assert_eq!(b.add_cells(origin, size, 3, &solid).err(), Some(ObstacleError::NotFinite));
+        }
+        // A corner past 1e18 is refused half way through the first loop's polygons, after others
+        // may have been added: the earlier ones go too.
+        assert_eq!(b.add_cells(v(1.0e18, 0.0), 1.0e18, 3, &solid).err(), Some(ObstacleError::OutOfRange));
+        // Cells so small beside their origin that two corners are the same `f32`.
+        assert_eq!(b.add_cells(v(1.0e9, 0.0), 1.0e-3, 3, &solid).err(), Some(ObstacleError::DegenerateEdge));
+        assert_eq!(b.clone().build().expect("the box").len(), 4, "a refused grid left something behind");
+        // Nothing to add is fine: an empty grid, a grid with nothing solid.
+        b.add_cells(Vec2::ZERO, 1.0, 0, &[]).expect("an empty grid");
+        b.add_cells(Vec2::ZERO, 1.0, 3, &[false; 6]).expect("an open grid");
+        assert_eq!(b.build().expect("the box").len(), 4);
     }
 }
