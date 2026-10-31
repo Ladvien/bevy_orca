@@ -44,6 +44,8 @@ let v = new_velocity(
 - A wall whose normal is not a unit vector (`Vec2::is_normalized`) or whose approach speed is not finite gives `Vec2::ZERO`. Walls are hard, so one that is not a half-plane holds the agent still rather than being dropped.
 - A neighbour whose position or velocity is not finite, or whose radius is negative or not finite, is skipped — one corrupted agent does not move anyone else — and so is one so far away that its constraint overflows `f32`.
 
+A finite preference is always usable, however long. One longer than `max_speed` is clamped to the speed disc along its own direction, and that includes one too long to square (above about `1.8e19`, which `offset / time_left` produces when `time_left` is tiny): the agent runs at full speed that way, it does not stop. `Crowd` follows the same rule for a member's `pref_vel`, and leaves its sideways nudge off a wish so large that the nudge cannot be added.
+
 Finite, in-range input passes every one of these checks, so none of them changes a single bit of a normal solve.
 
 ## A whole crowd
