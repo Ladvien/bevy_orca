@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.97.1"
 description = "Reciprocal Velocity Obstacles (ORCA) local collision avoidance on bevy_math's Vec2 — the 2-D linear program, no ECS."
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/Ladvien/bevy_orca"
+repository = "https://github.com/bevy-coven/bevy_orca"
 keywords = ["bevy", "gamedev", "ai", "navigation", "collision-avoidance"]
 categories = ["game-development", "simulation"]
 # `docs/` holds a 1 MB GIF, so it is out of the package. The NOTICE ships with the source it covers.

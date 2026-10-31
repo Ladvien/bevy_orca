@@ -3,7 +3,7 @@ description: One iteration of the bevy_orca improvement loop
 argument-hint: "[optional focus, e.g. 'a deadlock in two-way corridors only']"
 ---
 
-One run of this command is one iteration of a long-running loop on bevy_orca, a Bevy 0.20 leaf crate of Optimal Reciprocal Collision Avoidance: the 2-D linear program over discs on `bevy_math`'s `Vec2` that turns each agent's preferred velocity into the closest velocity no neighbour can object to, plus `Crowd`, the caller-owned batch helper (spatial hash, scratch buffers, deterministic tie-break) that solves a whole crowd per step. Games use it for local avoidance under whatever global navigator they already have: Sanctuary steps its villagers through it every tick, `bevy_society`'s persons move through it, and bevy_emerge's crowds-and-paths family issue (#107) previews walkers with it in the editor. Do ONE improvement per iteration, the single most valuable one from a game developer's point of view, finish it completely, then stop.
+One run of this command is one iteration of a long-running loop on bevy_orca, a Bevy 0.20 leaf crate of Optimal Reciprocal Collision Avoidance: the 2-D linear program over discs on `bevy_math`'s `Vec2` that turns each agent's preferred velocity into the closest velocity no neighbour can object to, plus `Crowd`, the caller-owned batch helper (spatial hash, scratch buffers, deterministic tie-break) that solves a whole crowd per step. Games use it for local avoidance under whatever global navigator they already have: Sanctuary steps its villagers through it every tick, `bevy_society`'s persons move through it, and bevy_grimoire's crowds-and-paths family issue (#107) previews walkers with it in the editor. Do ONE improvement per iteration, the single most valuable one from a game developer's point of view, finish it completely, then stop.
 
 This crate must be correct AND deterministic AND cheap on the caller's frame. Two discs that overlap, an agent that crosses a wall half-plane, a corridor where two streams freeze face to face, a velocity that changes with member order or thread count, and a step whose cost grows faster than the crowd are all failures, however good the circle swap looks. The judgement here is a crowd-simulation engineer's: no interpenetration and no NaN at any input, reciprocity kept (each side takes half), throughput quoted in agents per millisecond at thousands of agents, and an API that leaves the schedule, the neighbour rule and what is solid to the caller (`CLAUDE.md`, "The non-negotiable: no ECS, no plugin, no schedule").
 
@@ -160,7 +160,7 @@ each line with a measurement, not an impression:
 Before you pick an item, list the repository's open issues and triage them:
 
 ```sh
-gh issue list --repo Ladvien/bevy_orca --state open --limit 100 \
+gh issue list --repo bevy-coven/bevy_orca --state open --limit 100 \
   --json number,title,labels,createdAt --jq '.[] | "#\(.number) \(.title)"'
 ```
 
@@ -175,7 +175,7 @@ Then, in this order:
    others.
 2. **An issue labelled `consumer` is the pass's item next, ahead of the series and your own candidates.**
    A project built on this crate needs it and is waiting. The `consumer:<name>` label says which project;
-   `consumer:bevy_emerge` is the owner's editor. Its own work resumes when the issue is closed as completed
+   `consumer:bevy_grimoire` is the owner's editor. Its own work resumes when the issue is closed as completed
    and it moves its git pin to a `main` commit containing the fix. Take the oldest one you can work this pass.
    - **Build the general form.** The requester is the example, never a name in this crate's API, a path or a
      default: this crate serves other projects too. Where an issue asks for something shaped to one project,
@@ -237,7 +237,7 @@ what matters most to a game developer who will ship this:
 
 Ownership is a gate: the schedule, the world mapping, who is a neighbour (`sees`) and what is solid
 (`walls`) are the caller's (`CLAUDE.md`); global path planning, flow fields and navmeshes are the
-caller's navigator's, influence fields and trails are the sibling field crate's that bevy_emerge's
+caller's navigator's, influence fields and trails are the sibling field crate's that bevy_grimoire's
 crowds-and-paths issue pairs with this one, and anything that needs `bevy_ecs` or `bevy_app` is a
 wrapper the caller writes. Do not build those here; add a hook instead.
 
@@ -245,7 +245,7 @@ State in one sentence why your pick beats the runner-up. If it is too big, carve
 self-contained slice. Record the ranked candidate list in the log, not only the winner.
 
 **A pass never ends idle** (owner, 2026-10-29: "If they're not addressing bugs or enhancing features, they need to evolve their own code base to support Bevy Emerge better or add new features. Research these things in home still, implement them. They shouldn't stay idle."). An empty issue list or a stale backlog is this step's input, never a reason to ship nothing, and a candidate is not "speculation" once it is researched. When the ranked list above gives no workable item, take the first of these that applies:
-1. **What the crate's consumers hand-roll.** Read how Sanctuary uses this crate (`gh repo clone Ladvien/sanctuary /tmp/oN/sanctuary -- --depth 1`, then `rg -l 'bevy_orca|orca::'`; removed afterwards) and bevy_emerge's family issues (`gh issue list -R Ladvien/bevy_emerge --label family`, chiefly the crowds-and-paths one, #107). Find a formula, a wrapper or a query either writes by hand around this crate (wall half-planes from a grid or segments, a neighbour filter, a stuck-agent check, a congestion measure, a parallel step), and build its general form here, never named for either. Prove it with a test here.
+1. **What the crate's consumers hand-roll.** Read how Sanctuary uses this crate (`gh repo clone Ladvien/sanctuary /tmp/oN/sanctuary -- --depth 1`, then `rg -l 'bevy_orca|orca::'`; removed afterwards) and bevy_grimoire's family issues (`gh issue list -R bevy-coven/bevy_grimoire --label family`, chiefly the crowds-and-paths one, #107). Find a formula, a wrapper or a query either writes by hand around this crate (wall half-planes from a grid or segments, a neighbour filter, a stuck-agent check, a congestion measure, a parallel step), and build its general form here, never named for either. Prove it with a test here.
 2. **A feature a shipping game in this domain expects and this crate lacks**, found by research: home-still first (`distill_search`; for a paper the corpus lacks, `paper_search`, `paper_download`, `scribe_convert`, then `distill_index`), then shipped-game practice, then section 5 before any code.
 3. **Depth on the weakest existing feature**: measure it against its research note's validation targets and improve the worst gap.
 

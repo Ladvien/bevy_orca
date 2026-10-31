@@ -6,7 +6,7 @@ Optimal Reciprocal Collision Avoidance (ORCA) as a plain library: the 2-D linear
 
 **This repository is canonical.** It is where issues and pull requests belong; the split-out copies elsewhere are the ones that are frozen. MIT OR Apache-2.0.
 
-![Twenty coloured discs starting on a circle and crossing to the opposite side; they shear into a rotating vortex through the contested centre without colliding, then re-form on the far side](https://raw.githubusercontent.com/Ladvien/bevy_orca/main/docs/circle_swap.gif)
+![Twenty coloured discs starting on a circle and crossing to the opposite side; they shear into a rotating vortex through the contested centre without colliding, then re-form on the far side](https://raw.githubusercontent.com/bevy-coven/bevy_orca/main/docs/circle_swap.gif)
 
 That is `examples/circle_swap.rs`: every agent walking to the point directly opposite its own, so all of them want the exact centre at the same moment. **The rotation is not scripted.** Nobody is told to turn, there is no path planner and no flow field — each agent solves a small linear program for the velocity closest to what it wanted that no neighbour can object to, and the vortex is what falls out when twenty of them do that simultaneously.
 

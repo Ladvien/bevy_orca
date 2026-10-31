@@ -8,7 +8,7 @@ Read this pass (`gh repo clone … --depth 1`, removed afterwards):
 
 - `bevy_society/src/steering.rs`: `mut crowd: Local<Crowd>`, `mut members: Local<Vec<CrowdMember>>`, one `crowd.solve(...)` inside a Bevy system. Serial.
 - `sanctuary/src/crowd.rs`: the same ring in `solve_crowd`, reusing buffers between frames; `siege/mob_crowd.rs` places a mob on a ring and has no solver of its own.
-- `bevy_emerge_mapper/src/ops_crowd.rs`: the editor's walkers preview. Serial.
+- `bevy_grimoire_mapper/src/ops_crowd.rs`: the editor's walkers preview. Serial.
 
 None of them steps thousands yet and none hand-rolls a parallel ring. The shape they would take is the one they already use: a `Local` that holds the solver's buffers, now several of them. That is what the API below is for: a host with `Local<Vec<CrowdWorker>>` and `ComputeTaskPool::scope`, not one with a threading library inside this crate.
 

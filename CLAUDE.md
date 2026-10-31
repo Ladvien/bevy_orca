@@ -4,7 +4,7 @@ ORCA local collision avoidance: the 2-D linear program over discs, on `bevy_math
 
 ## Source of truth
 
-This repository, [`Ladvien/bevy_orca`](https://github.com/Ladvien/bevy_orca), is canonical since 2026-10-23: it moved to Bevy 0.20 while `foundation_vs_slop/crates/bevy_orca` stays frozen on 0.19. Do not mirror over it with `scripts/mirror_crates.sh`. MIT OR Apache-2.0.
+This repository, [`bevy-coven/bevy_orca`](https://github.com/bevy-coven/bevy_orca), is canonical since 2026-10-23: it moved to Bevy 0.20 while `foundation_vs_slop/crates/bevy_orca` stays frozen on 0.19. Do not mirror over it with `scripts/mirror_crates.sh`. MIT OR Apache-2.0.
 
 ## Build and test
 
