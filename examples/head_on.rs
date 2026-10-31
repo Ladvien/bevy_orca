@@ -14,8 +14,10 @@
 //! 3. **The neighbour holds ground** (`avoids: false`). The mover takes the *full* avoidance instead
 //!    of assuming an idle unit will step aside and then walking through it.
 //! 4. **One has the right of way** (`Agent::priority`, 3 against 1). Both still step aside, but A takes a
-//!    quarter of the dodge and B three quarters, where case 2 gave each a half: the pair as a whole
-//!    dodges as much, and the one that matters more to the player dodges less.
+//!    quarter of each step's dodge and B three quarters, where case 2 gave each a half. The more B moves
+//!    the less is left for A to do, so A ends up sidestepping a small fraction of what B does, while the
+//!    pair as a whole steps aside about as far as two equal agents: the one that matters more to the
+//!    player gives way less.
 //!
 //! Run: `cargo run -p bevy_orca --example head_on`
 
@@ -146,9 +148,9 @@ fn main() {
     report(&right_of_way);
     if right_of_way.peak_b > 1.0e-4 {
         println!(
-            "  ratio A/B = {:.2} — a pair that splits the dodge 1 : 3 (A takes 1/4 of it, B 3/4: `other / (this + other)`),\n\
-             where case 2 split it 1 : 1. Together they step aside {:.3} against {:.3}: the pair dodges as much,\n\
-             only who does the dodging has changed.",
+            "  ratio A/B = {:.2}: A takes a quarter of each step's dodge and B three quarters (`other / (this + other)`),\n\
+             and the more B moves the less is left for A, so A sidesteps a small fraction of B's. Together they step\n\
+             aside {:.3} against {:.3} for two equal agents: the pair dodges as much, and who does it has changed.",
             right_of_way.peak_a / right_of_way.peak_b,
             right_of_way.peak_a + right_of_way.peak_b,
             split.peak_a + split.peak_b
