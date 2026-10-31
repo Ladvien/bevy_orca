@@ -14,7 +14,7 @@
 //!
 //! ```text
 //! orca: <scene> agents=<n> threads=<t> order=<fwd|rev> median_us=<x> p99_us=<y> agents_per_ms=<a>
-//!       cand_mean=<c> cand_max=<m> hash=<h> [overlap_max=<o> wall_max=<w> allocs=<k>]
+//!       cand_mean=<c> cand_max=<m> hash=<h> [overlap_max=<o> wall_max=<w> speed_max=<s> allocs=<k>]
 //! ```
 //!
 //! - `median_us` / `p99_us` — one step's solve, the part a host pays every tick. Building the member
@@ -27,10 +27,12 @@
 //!   `new_velocity_in` over member chunks on `std::thread::scope` workers, one `OrcaScratch` each,
 //!   with the neighbour rule `Crowd` uses. All of a case's hashes must be equal.
 //! - `overlap_max` — the deepest overlap between two agents on any step, as a fraction of the radius.
-//!   `wall_max` — the deepest penetration past a wall, in metres. `allocs` — allocations made inside
-//!   the timed `Crowd::solve` calls: a warm `Crowd` allocates only while a buffer grows to a wider
-//!   call than it has seen, so a scene that densifies shows a handful, never one per step. These
-//!   three are measured on the `threads=1 order=fwd` run.
+//!   `wall_max` — the deepest penetration past a wall, in metres. `speed_max` — the largest solved
+//!   speed on any step as a fraction of its member's `max_speed`: `1.0000` is the bound, and anything
+//!   above `1.000001` is the linear program's answer leaving the speed disc. `allocs` — allocations
+//!   made inside the timed `Crowd::solve` calls: a warm `Crowd` allocates only while a buffer grows to
+//!   a wider call than it has seen, so a scene that densifies shows a handful, never one per step.
+//!   These four are measured on the `threads=1 order=fwd` run.
 //!
 //! After each scene, `scaling_1k_10k` is the exponent of the median step from 1 000 to 10 000 agents
 //! at constant density: 1.0 is linear.
@@ -583,6 +585,19 @@ fn solve_parallel(
 // ---------------------------------------------------------------------------------------------
 // Running a case.
 
+/// The largest `|v| / max_speed` among the solved velocities of one step (`0` if none is solved or a
+/// member's `max_speed` is not positive). In `f64`, so a rounding-level excess over `1` is visible.
+fn speed_ratio(members: &[CrowdMember], solved: &[Option<Vec2>]) -> f64 {
+    members
+        .iter()
+        .zip(solved)
+        .filter_map(|(m, v)| {
+            let v = (*v)?;
+            (m.max_speed > 0.0).then(|| f64::from(v.x).hypot(f64::from(v.y)) / f64::from(m.max_speed))
+        })
+        .fold(0.0, f64::max)
+}
+
 struct Outcome {
     median_us: f64,
     p99_us: f64,
@@ -592,6 +607,7 @@ struct Outcome {
     hash: u64,
     overlap_max: f32,
     wall_max: f32,
+    speed_max: f64,
     allocs: usize,
 }
 
@@ -612,6 +628,7 @@ fn run(scene: Scene, n: usize, threads: usize, reversed: bool, measure: bool) ->
     let mut times = Vec::with_capacity(TIMED);
     let (mut solved_total, mut cand_total, mut cand_max) = (0usize, 0usize, 0usize);
     let (mut overlap_max, mut wall_max, mut alloc_total) = (0.0f32, 0.0f32, 0usize);
+    let mut speed_max = 0.0f64;
 
     for step in 0..WARMUP + TIMED {
         world.members(reversed, &mut members, &mut slots);
@@ -659,6 +676,7 @@ fn run(scene: Scene, n: usize, threads: usize, reversed: bool, measure: bool) ->
         }
         world.advance(&slots, &out);
         if measure {
+            speed_max = speed_max.max(speed_ratio(&members, &out));
             overlap_max = overlap_max.max(world.deepest_overlap(&mut check_grid));
             for a in 0..n {
                 if !world.gone[a] {
@@ -681,6 +699,7 @@ fn run(scene: Scene, n: usize, threads: usize, reversed: bool, measure: bool) ->
         hash: state_hash(&world.pos, &world.vel),
         overlap_max,
         wall_max,
+        speed_max,
         allocs: alloc_total,
     }
 }
@@ -699,7 +718,10 @@ fn line(scene: Scene, n: usize, threads: usize, reversed: bool, o: &Outcome, mea
         o.hash,
     );
     if measured {
-        s += &format!(" overlap_max={:.4} wall_max={:.4} allocs={}", o.overlap_max, o.wall_max, o.allocs);
+        s += &format!(
+            " overlap_max={:.4} wall_max={:.4} speed_max={:.6} allocs={}",
+            o.overlap_max, o.wall_max, o.speed_max, o.allocs
+        );
     }
     println!("{s}");
 }
@@ -718,6 +740,7 @@ fn arrive(scene: Scene, n: usize, metres_per_agent: f32) {
     let (mut members, mut slots, mut out) = (Vec::new(), Vec::new(), Vec::new());
     let mut check_grid = Grid::default();
     let (mut overlap_max, mut wall_max) = (0.0f32, 0.0f32);
+    let mut speed_max = 0.0f64;
     let (mut t50, mut t90) = (None, None);
     for step in 0..steps {
         world.members(false, &mut members, &mut slots);
@@ -728,6 +751,7 @@ fn arrive(scene: Scene, n: usize, metres_per_agent: f32) {
             crowd.solve(&members, &params, DT, |_, _| true, |i, buf| world.walls(members[i].pos, buf));
         out.clear();
         out.extend_from_slice(solved);
+        speed_max = speed_max.max(speed_ratio(&members, &out));
         world.advance(&slots, &out);
         overlap_max = overlap_max.max(world.deepest_overlap(&mut check_grid));
         for a in 0..n {
@@ -754,7 +778,7 @@ fn arrive(scene: Scene, n: usize, metres_per_agent: f32) {
     };
     println!(
         "orca: arrive {} agents={n} steps={steps} arrived={:.3} stalled={stalled} overlap_max={:.4} wall_max={:.4} \
-         hash={:016x} t50_s={t50} t90_s={t90}{ring}",
+         speed_max={speed_max:.6} hash={:016x} t50_s={t50} t90_s={t90}{ring}",
         scene.name(),
         arrived as f64 / n as f64,
         overlap_max,
