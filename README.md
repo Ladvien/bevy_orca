@@ -59,7 +59,7 @@ use bevy_orca::{Crowd, CrowdMember, CrowdParams};
 let members: Vec<CrowdMember> = people
     .iter()
     .map(|p| CrowdMember {
-        key: p.id,                      // your stable id: breaks ties, picks the nudge side
+        key: p.id,                      // your stable id: breaks ties between equidistant neighbours
         pos: p.pos,
         vel: p.vel,
         radius: 0.4,
@@ -85,17 +85,17 @@ for (member, v) in members.iter().zip(solved) {
 }
 ```
 
-The caller still owns the two gameplay decisions — **who is a neighbour** (`sees`) and **what is solid** (`walls`). `Crowd` only decides how they are found and how they are solved. `key` is what makes the result a property of the world rather than of your iteration order: candidates sort by `(distance, key)`, and a head-on meeting steps to a side hashed from each member's own key, so two agents do not pick the same side and stall.
+The caller still owns the two gameplay decisions — **who is a neighbour** (`sees`) and **what is solid** (`walls`). `Crowd` only decides how they are found and how they are solved. `key` is what makes the result a property of the world rather than of your iteration order: candidates sort by `(distance, key)`. The side a crowd passes on is not the key's but one number's: `CrowdParams::nudge` kicks every member toward the **same** side of its own wish, the right for a positive value (clockwise in your plane, which is where ORCA's own tie-break sends two agents walking straight at each other) and the left for a negative one, so two agents meeting head-on are kicked past each other and a crowd crossing a crowd turns, and lanes, one way.
 
 A member is `None` when it has no preference, its preference is not finite, or its position is not finite. Every other member gets `new_velocity_in`'s answer, so one whose velocity or radius is unusable, or whose `max_speed` is not finite, not positive or so large its square overflows, is solved to `Vec2::ZERO` and holds still; and a member whose position, velocity or radius is unusable is nobody's neighbour and takes none of the `max_neighbours` places.
 
 Reciprocity is assumed only of a neighbour this step moves. A member that is `None`, or that is solved to a stop because its `max_speed` leaves it no velocity (root a unit by setting it to `0.0`, and keep its wish if you like), is avoided in **full** by everyone near it; every other neighbour takes half. The solver's skip and the avoidance flag come from one test, so they cannot disagree.
 
-`Crowd` allocates nothing after its buffers are warm, wherever the crowd walks and however tightly it packs: its neighbour grid is one entry per member, sorted by cell and rebuilt every solve, so its memory and its cost follow how many members there are and not how much ground they have covered; and of the candidates in range only the nearest `max_neighbours` are kept, found and ordered in place, so a member with hundreds of others in range pays for its ten neighbours rather than for ordering the rest. `CrowdParams::new(range)` gives a 2-second horizon, at most 10 neighbours and a 5% nudge; set `nudge` to `0.0` to keep perfectly symmetric input perfectly symmetric.
+`Crowd` allocates nothing after its buffers are warm, wherever the crowd walks and however tightly it packs: its neighbour grid is one entry per member, sorted by cell and rebuilt every solve, so its memory and its cost follow how many members there are and not how much ground they have covered; and of the candidates in range only the nearest `max_neighbours` are kept, found and ordered in place, so a member with hundreds of others in range pays for its ten neighbours rather than for ordering the rest. `CrowdParams::new(range)` gives a 2-second horizon, at most 10 neighbours and a 5% nudge to the right; set `nudge` to `0.0` to keep perfectly symmetric input perfectly symmetric, or negative to pass on the left.
 
 ## Units and plane
 
-`Vec2` is **the host's ground plane**, in the host's units: the crate never converts and never assumes a metric. `time_horizon` and `dt` must be in the same unit as your `vel` and `max_speed` — seconds and metres per second, or game-days and units per day, but not one of each. `neighbour_range`, `pos` and `radius` are in that same length unit.
+`Vec2` is **the host's ground plane**, in the host's units: the crate never converts and never assumes a metric. `time_horizon` and `dt` must be in the same unit as your `vel` and `max_speed` — seconds and metres per second, or game-days and units per day, but not one of each. `neighbour_range`, `pos` and `radius` are in that same length unit. Left and right are the plane's own: a positive `CrowdParams::nudge` kicks clockwise in `(x, y)`, which is the walker's right when `+y` is up. A world whose ground plane is `(x, z)` may see that as its left, which is why the sign is yours to flip.
 
 ## Scope
 
@@ -129,7 +129,7 @@ cargo run -p bevy_orca --example circle_swap    # the gif above. Needs a GPU.
 
 `circle_swap` is the picture. Two things in it are worth knowing before you tune this in your own game, because both were found by watching it fail:
 
-- **Perfect symmetry deadlocks.** Identical agents, evenly spaced, all aimed at one point give the linear program no reason to prefer left over right, and the ring simply stalls. RVO2's own circle demo perturbs the preferred velocity for this reason, and `Crowd`'s `nudge` does it deterministically from each member's key.
+- **Perfect symmetry stalls, and so does a ring packed shoulder to shoulder.** Identical agents, evenly spaced, all aimed at one point give the linear program no reason to prefer left over right. `Crowd`'s `nudge` is the deterministic tie-break, and it is one side for the whole crowd: a crowd that all leans the same way crosses as one vortex. At the defaults (`CrowdParams::new(3.0)`, 0.3 m radius, 1 m of ring per agent) `bench` finds a 100-agent swap with nobody stalled and 90% through in 35 s, where a side hashed per member stalled 33 and took 61 s, and a 1 000-agent swap in 266 s with none stalled against 347 s with 606. It cannot free a ring that is already as tight as it can be: 20 agents of radius 0.3 on a 3.2 m ring converge and stop where their discs touch (a ring of 1.92 m), because moving in closes the gap to both neighbours and the velocity closest to a wish that points in is zero. That is a fixed point of the solver, not a tie, and the cure is room (the same 20 agents on 1.9 m of ring each arrive in 15 s) or a navigator that gives a stuck agent a new wish. `bench` keeps the tight ring's row so the limit stays measured.
 - **Too much lookahead stalls it too, and less obviously.** At a 3-second horizon the pack braked for a congestion that had not happened yet and thereby caused it: velocity decayed geometrically — 0.80, 0.57, 0.41, 0.29, 0.21 — while the crossing ground to a halt a ring-radius in. At 1.5 they commit, and the shear resolves it. If your crowd is mysteriously slow, this dial is the first suspect.
 
 ## Used by
