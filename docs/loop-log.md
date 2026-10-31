@@ -198,6 +198,8 @@ All 32 non-rally single-thread rows: mean −9.5%, median −3.6%. Over +5% in t
 
 **Release.** None. `v0.2.1` is 10 h old (the 6 h window is open), but this host still has no crates.io credential (`~/.cargo/credentials.toml` absent, no `CARGO_REGISTRY_TOKEN`) and no `cargo-semver-checks`, so a bump and tag would name a crate nobody can `cargo add`. No public item changed (the helpers `direction_of` and `OVERFLOW_SCALE` are private), so the next release on a host with credentials is a patch, **0.2.2**, carrying iterations 2, 3, 4 and 5 from `## [Unreleased]`.
 
+**Gate on the merged tree** (`f16ede6`, pushed): `cargo fmt --check`, clippy `--all-targets --all-features -D warnings`, rustdoc `-D warnings`, `cargo build` / `--all-features` / `--release`, `cargo test` and `cargo test --all-features` (27 + 5 + 2 each) and `cargo build --examples --all-features` all exit 0 (the one `circle_swap` warning is the macOS linker's `__eh_frame` note from iteration 4). Issue #9 closed by the push (`Fixes #9`), with the assumed-decision comment, the `assumed-decision` label and an evidence comment; no issue is open.
+
 ### Ranked backlog
 
 1. **The speed bound under f32 cancellation** (iteration 2 #1, 3 #3, 4 #2; measured again this pass: 28 of 402 299 sane-wish and 11 of 197 701 huge-wish solves over 1.001× `max_speed`, 132 of 400 000 with own velocities of 1e9+, and 6 huge wishes still answered `ZERO` at own velocities ≥ 1e9): pass 1's note and first implementation are on `origin/loop/iter-3` (`060ffa3`, `1e22bc5`), never gated — adopt, finish, gate.
