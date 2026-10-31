@@ -286,10 +286,9 @@ impl Crowd {
 
             // The wish, kicked toward the right of its own direction when anyone is near: the same side
             // for every member, so two agents meeting head-on are kicked past each other and a stream
-            // keeps to one side. (The kick used to take a side hashed from the member's key, which left
-            // the pair's relative velocity exactly collinear whenever the two draws differed.) A kick the
-            // wish cannot take — the sum is not finite, as for a wish near `f32::MAX` — is not applied:
-            // such a wish is a direction already, and `new_velocity_in` would refuse the non-finite sum.
+            // keeps to one side. A kick the wish cannot take — the sum is not finite, as for a wish near
+            // `f32::MAX` — is not applied: such a wish is a direction already, and `new_velocity_in`
+            // would refuse the non-finite sum.
             let wish = if self.near.is_empty() {
                 pref
             } else {
