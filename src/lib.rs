@@ -46,9 +46,10 @@ const EPSILON: f32 = 1.0e-5;
 /// A disc agent in the xz ground plane (y dropped): position, current velocity, radius.
 ///
 /// `avoids` is whether this agent is *also* running avoidance this step. When a neighbor avoids
-/// too (another commanded unit), the pair splits the avoidance 50/50 (reciprocity). When it does
-/// not (an idle unit holding ground), the moving agent takes the **full** avoidance so the idle
-/// unit isn't assumed to step aside and get walked through.
+/// too (another commanded unit), the pair splits the avoidance (reciprocity): evenly, unless their
+/// [`priority`](Self::priority) differs. When it does not (an idle unit holding ground), the moving
+/// agent takes the **full** avoidance so the idle unit isn't assumed to step aside and get walked
+/// through.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect))]
@@ -57,12 +58,40 @@ pub struct Agent {
     pub vel: Vec2,
     pub radius: f32,
     pub avoids: bool,
+    /// Right of way against a neighbour that also avoids: a ratio, so only comparisons mean anything.
+    /// Of the dodge a collision course asks for, this agent takes `other / (this + other)` and the
+    /// neighbour takes the rest, so the two shares add to 1 (the condition the collision-free
+    /// guarantee needs) and both sides compute them from the same two numbers. Equal priorities are
+    /// ORCA's even half; `3` against `1` takes a quarter and leaves the neighbour three quarters;
+    /// `0` against anything above it takes all of it, and `∞` against anything finite takes none.
+    /// A NaN or negative priority counts as `0`: the member gives way and never pushes harder.
+    /// A neighbour with `avoids: false` is avoided in full whatever its priority, and walls always
+    /// are. `1.0` is the default and, for a crowd that never changes it, plain ORCA.
+    pub priority: f32,
 }
 
 impl Default for Agent {
     fn default() -> Self {
-        Self { pos: Vec2::ZERO, vel: Vec2::ZERO, radius: 0.0, avoids: false }
+        Self { pos: Vec2::ZERO, vel: Vec2::ZERO, radius: 0.0, avoids: false, priority: 1.0 }
     }
+}
+
+/// The share of an avoidance an agent of priority `own` takes against a neighbour of priority
+/// `other`, both of which step aside: `other / (own + other)`, so the pair's two shares add to 1.
+///
+/// Written as `1 / (1 + own / other)` because the sum overflows for two huge priorities and
+/// `∞ / (∞ + x)` is NaN, where the ratio is `0`, finite or `∞` for every unequal pair; the two
+/// equal-priority cases whose ratio would be NaN (`0 / 0`, `∞ / ∞`) are caught first and are the
+/// plain half, which also keeps a crowd that never sets a priority on exactly the `0.5` it had.
+/// `f32::max` ignores a NaN, so a priority that is NaN or negative becomes `0`.
+///
+/// The A* Pathfinding Project ships `other.priority / (this.priority + other.priority)`, and RVO's
+/// generalised obstacle (van den Berg, Lin & Manocha, ICRA 2008, §III-C) asks only that the two
+/// shares add to 1.
+#[inline]
+pub(crate) fn share(own: f32, other: f32) -> f32 {
+    let (own, other) = (own.max(0.0), other.max(0.0));
+    if own == other { 0.5 } else { 1.0 / (1.0 + own / other) }
 }
 
 /// A half-plane constraint `{ v : det(direction, v - point) >= 0 }` on the new velocity.
