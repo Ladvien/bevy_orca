@@ -45,6 +45,15 @@ pub struct CrowdMember {
     /// finite is the same as `None`; a finite one is always a wish, however long — one too long to
     /// square (above `1.8e19`) is a direction at full speed, not a stop.
     pub pref_vel: Option<Vec2>,
+    /// Right of way against a member that also steps aside this step: a ratio, `1.0` unless the host
+    /// says otherwise. Of the dodge a collision course asks for, this member takes
+    /// `other / (this + other)` and the other takes the rest, so equal priorities split it evenly
+    /// (ORCA's half), a member of priority `4` against one of `1` takes a fifth, and a stall-holder
+    /// the street should walk around is given more than the walkers. It is not an immovable member:
+    /// that is `pref_vel: None` or a `max_speed` of `0`, which everyone avoids in full whatever this
+    /// says. NaN or negative counts as `0` (the member gives way), `∞` as the right of way over any
+    /// finite priority. See [`Agent::priority`].
+    pub priority: f32,
 }
 
 /// How a crowd is solved. There is no [`Default`]: [`CrowdParams::neighbour_range`] is in the caller's
@@ -162,6 +171,7 @@ pub struct CrowdWorker {
 ///         radius: 0.3,
 ///         max_speed: 1.3,
 ///         pref_vel: Some(Vec2::X),
+///         priority: 1.0,
 ///     })
 ///     .collect();
 /// let params = CrowdParams::new(3.0);
@@ -504,6 +514,7 @@ impl CrowdStep<'_> {
                     // A member this step will not move is not assumed to step aside, so this one
                     // takes the full avoidance against it instead of walking through it.
                     avoids: self.steered.get(j).is_some_and(|&steered| steered),
+                    priority: other.priority,
                 });
             }
 
@@ -522,7 +533,7 @@ impl CrowdStep<'_> {
             worker.walls.clear();
             walls(i, &mut worker.walls);
 
-            let me = Agent { pos: m.pos, vel: m.vel, radius: m.radius, avoids: true };
+            let me = Agent { pos: m.pos, vel: m.vel, radius: m.radius, avoids: true, priority: m.priority };
             // The obstacle lines come after the caller's own walls and are never relaxed, like them.
             if let Some(obstacles) = self.obstacles {
                 obstacles.push_walls(
@@ -553,7 +564,7 @@ mod tests {
     use super::*;
 
     fn member(key: u64, pos: Vec2, vel: Vec2, pref: Option<Vec2>) -> CrowdMember {
-        CrowdMember { key, pos, vel, radius: 0.5, max_speed: 1.5, pref_vel: pref }
+        CrowdMember { key, pos, vel, radius: 0.5, max_speed: 1.5, pref_vel: pref, priority: 1.0 }
     }
 
     /// The SplitMix64 output mix: the tests' own stable pseudo-random numbers.
@@ -699,6 +710,7 @@ mod tests {
                     radius,
                     max_speed: speed,
                     pref_vel: Some(pref),
+                    priority: 1.0,
                 });
                 slots.push(i);
             }
@@ -945,11 +957,14 @@ mod tests {
     #[test]
     fn a_dense_crowd_is_solved_against_its_nearest_neighbours() {
         // A 15 × 15 lattice 0.5 apart: every member has rings of neighbours at bit-equal distances.
-        // Keys are scrambled so key order is neither slice order nor lattice order, and velocities
-        // differ so that which neighbours are kept changes the answer.
+        // Keys are scrambled so key order is neither slice order nor lattice order, velocities
+        // differ so that which neighbours are kept changes the answer, and priorities differ (a few of
+        // them zero, infinite and NaN) so that a priority the crowd drops or misreads changes it too.
+        let priorities = [1.0, 0.5, 2.0, 8.0, 0.0, f32::INFINITY, f32::NAN, 1.0, -3.0];
         let members: Vec<CrowdMember> = (0..225u64)
             .map(|i| CrowdMember {
                 radius: 0.2,
+                priority: priorities[(splitmix64(i ^ 5) % priorities.len() as u64) as usize],
                 ..member(
                     splitmix64(i),
                     Vec2::new((i % 15) as f32, (i / 15) as f32) * 0.5,
@@ -980,8 +995,10 @@ mod tests {
                     vel: members[j].vel,
                     radius: members[j].radius,
                     avoids: true,
+                    priority: members[j].priority,
                 }));
-                let me = Agent { pos: m.pos, vel: m.vel, radius: m.radius, avoids: true };
+                let me =
+                    Agent { pos: m.pos, vel: m.vel, radius: m.radius, avoids: true, priority: m.priority };
                 let pref = m.pref_vel.unwrap_or_default();
                 let want = new_velocity_in(
                     &mut scratch,
@@ -1117,6 +1134,7 @@ mod tests {
                     radius: value(0.2, 0.5),
                     max_speed: value(0.5, 2.0),
                     pref_vel: Some(Vec2::new(value(-1.5, 1.5), value(-1.5, 1.5))),
+                    priority: value(0.0, 4.0),
                 })
                 .collect();
             let walls: Vec<(Vec2, f32)> = (0..n)
@@ -1178,6 +1196,7 @@ mod tests {
                     radius: 0.2 + next() * 0.3,
                     max_speed: 0.5 + next() * 1.5,
                     pref_vel: Some(Vec2::new(next() * 3.0 - 1.5, next() * 3.0 - 1.5)),
+                    priority: 1.0,
                 };
                 let hostile = HOSTILE[((next() * HOSTILE.len() as f32) as usize).min(HOSTILE.len() - 1)];
                 match (next() * 9.0) as usize {
@@ -1352,6 +1371,7 @@ mod tests {
                     radius: 0.25 + 0.15 * next(),
                     max_speed: 1.0 + 0.5 * next(),
                     pref_vel: Some(Vec2::from_angle(std::f32::consts::TAU * next()) * (0.8 + 0.7 * next())),
+                    priority: 1.0,
                 })
                 .collect();
             for step in 0..30 {

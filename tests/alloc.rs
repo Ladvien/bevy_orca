@@ -60,7 +60,7 @@ unsafe impl GlobalAlloc for Counting {
 static GLOBAL: Counting = Counting;
 
 fn agent(pos: Vec2, vel: Vec2) -> Agent {
-    Agent { pos, vel, radius: 0.5, avoids: true }
+    Agent { pos, vel, radius: 0.5, avoids: true, priority: 1.0 }
 }
 
 /// A deterministic `u32 -> [0,1)` hash (PCG-style output mix), copied by construction from the crate's
@@ -150,6 +150,7 @@ fn a_warmed_crowd_allocates_nothing() {
                 radius: 0.28,
                 max_speed: 1.5,
                 pref_vel: Some(Vec2::new(angle.cos(), angle.sin())),
+                priority: 1.0,
             }
         })
         .collect();
@@ -186,6 +187,7 @@ fn a_warmed_crowd_that_walks_into_new_cells_allocates_nothing() {
             radius: 0.28,
             max_speed: 1.5,
             pref_vel: Some(Vec2::X),
+            priority: 1.0,
         })
         .collect();
     let at_tick = |tick: u32, members: &mut Vec<CrowdMember>| {
@@ -229,6 +231,7 @@ fn a_warmed_dense_crowd_allocates_nothing() {
             radius: 0.07,
             max_speed: 1.5,
             pref_vel: Some(Vec2::X),
+            priority: 1.0,
         })
         .collect();
     let mut crowd = Crowd::default();
@@ -260,6 +263,7 @@ fn a_warmed_split_step_allocates_nothing() {
             radius: 0.07,
             max_speed: 1.5,
             pref_vel: Some(Vec2::X),
+            priority: 1.0,
         })
         .collect();
     let mut crowd = Crowd::default();
@@ -319,6 +323,7 @@ fn a_warmed_crowd_among_obstacles_allocates_nothing() {
             radius: 0.3,
             max_speed: 1.5,
             pref_vel: Some(Vec2::new(1.0, 0.0)),
+            priority: 1.0,
         })
         .collect();
     let mut crowd = Crowd::default();
