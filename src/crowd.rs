@@ -74,8 +74,9 @@ pub struct CrowdParams {
     /// Seconds of lookahead against [`Obstacles`], separate from `time_horizon`: only
     /// [`Crowd::solve_around`] reads it. An agent should not be "shy" of a wall it must pass close
     /// to in order to avoid another agent, so this is ordinarily shorter than `time_horizon` (the
-    /// ORCA paper's section 5.4; Menge ships 0.15 s against 3 s). It must be at least the step `dt`,
-    /// or an agent can cross a wall within one step. It is also how far an agent looks for walls:
+    /// ORCA paper's section 5.4; Menge ships 0.15 s against 3 s). [`Crowd::solve_around`] raises it
+    /// to the step `dt` if it is shorter, because a horizon under the step lets a member cross a
+    /// wall within it. It is also how far a member looks for walls:
     /// `obstacle_horizon · max_speed + radius`.
     pub obstacle_horizon: f32,
 }
@@ -222,7 +223,8 @@ impl Crowd {
     /// [`solve`](Self::solve) among static [`Obstacles`]: every member also keeps clear of the
     /// polygons and walls in `obstacles`, by hard lines that go after the member's `walls` and ahead
     /// of every neighbour, are never relaxed, and are cast `params.obstacle_horizon` seconds ahead
-    /// (see [`Obstacles::push_walls`]). An empty set gives exactly the answers `solve` gives.
+    /// (raised to `dt` if shorter, since a horizon under the step lets a member cross a wall within
+    /// it; see [`Obstacles::push_walls`]). An empty set gives exactly the answers `solve` gives.
     ///
     /// `walls` is still the caller's, for what changes every step (a door that opens); pass
     /// `|_, _| {}` when there is none. Obstacles make a member avoid, not navigate: the way round a
@@ -354,7 +356,8 @@ impl Crowd {
                     &mut self.scratch,
                     &me,
                     m.max_speed,
-                    params.obstacle_horizon,
+                    // Not shorter than the step: a horizon under `dt` lets a member cross a wall within it.
+                    params.obstacle_horizon.max(dt),
                     &mut self.walls,
                 );
             }
