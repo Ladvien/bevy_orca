@@ -242,6 +242,47 @@ fn a_warmed_dense_crowd_allocates_nothing() {
     assert_eq!(allocs(), 0, "5 warmed solves of a dense crowd allocated {} time(s)", allocs());
 }
 
+/// The split step is the same ring, so it makes the same promise: once the grid, a worker per range and
+/// the output are warm, `begin` and `solve_range` over four ranges of a packed crowd allocate nothing.
+/// (Counted on this thread: the ranges run here one after another, which is what a single-threaded
+/// host does with the same API, and a worker thread has its own warm buffers to count.)
+#[test]
+fn a_warmed_split_step_allocates_nothing() {
+    use bevy_orca::{Crowd, CrowdMember, CrowdParams, CrowdWorker};
+
+    let params = CrowdParams::new(4.0);
+    let dt = 1.0 / 60.0;
+    let members: Vec<CrowdMember> = (0..200u32)
+        .map(|i| CrowdMember {
+            key: u64::from(i),
+            pos: Vec2::new((i % 20) as f32, (i / 20) as f32) * 0.15,
+            vel: Vec2::ZERO,
+            radius: 0.07,
+            max_speed: 1.5,
+            pref_vel: Some(Vec2::X),
+        })
+        .collect();
+    let mut crowd = Crowd::default();
+    let mut workers: Vec<CrowdWorker> = (0..4).map(|_| CrowdWorker::default()).collect();
+    let mut out = vec![None; members.len()];
+    let tick = |crowd: &mut Crowd, workers: &mut [CrowdWorker], out: &mut [Option<Vec2>]| {
+        let step = crowd.begin(&members, &params, dt);
+        for (c, slice) in out.chunks_mut(50).enumerate() {
+            if let Some(worker) = workers.get_mut(c) {
+                step.solve_range(worker, c * 50, slice, |_, _| true, |_, buf| buf.clear());
+            }
+        }
+    };
+    tick(&mut crowd, &mut workers, &mut out);
+
+    reset_counter();
+    for _ in 0..5 {
+        tick(&mut crowd, &mut workers, &mut out);
+        assert!(out.iter().flatten().all(|v| v.is_finite()));
+    }
+    assert_eq!(allocs(), 0, "5 warmed split steps allocated {} time(s)", allocs());
+}
+
 /// And for a crowd among obstacles: the edge candidates, the grid query and the lines it casts all
 /// live in buffers that stop growing. A crowd walking a street grid of 36 buildings for 20 ticks,
 /// every one of them moving to new ground, allocates nothing once warm.

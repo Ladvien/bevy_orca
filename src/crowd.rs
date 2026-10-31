@@ -96,9 +96,13 @@ impl CrowdParams {
 /// it is safe to solve several crowds with one `Crowd`, one after the other. Its buffers grow to the
 /// largest crowd it has solved and never shrink, so once warm it allocates nothing, wherever the crowd
 /// walks and however tightly it packs.
+///
+/// To spread one step over several threads, [`begin`](Self::begin) builds the grid and hands back a
+/// [`CrowdStep`] whose ranges any number of [`CrowdWorker`]s can solve at once; `solve` is that, on one
+/// range with the crowd's own worker.
 #[derive(Debug, Default)]
 pub struct Crowd {
-    scratch: OrcaScratch,
+    worker: CrowdWorker,
     /// The neighbour grid: `(cell key, member index)` for every member that can be a neighbour (finite
     /// position and velocity, finite non-negative radius), sorted,
     /// `neighbour_range` per cell. Rebuilt every solve, so its size is the crowd's and not the ground
@@ -107,6 +111,21 @@ pub struct Crowd {
     /// Whether [`steers`] holds for each member, filled in the same pass as the grid. A neighbour's
     /// `avoids` is read from here, so the test runs once per member and not once per neighbour offered.
     steered: Vec<bool>,
+    /// Reused output, indexed like the members slice.
+    out: Vec<Option<Vec2>>,
+}
+
+/// The buffers one thread solves members with: the line-program scratch, the candidate and neighbour
+/// lists, and the wall buffer.
+///
+/// [`CrowdStep::solve_range`] takes one, so a host that splits a step over threads keeps one per
+/// thread (in a Bevy system, a `Local<Vec<CrowdWorker>>`); [`Crowd`] owns the one [`Crowd::solve`]
+/// uses. It holds no per-member state and nothing in it carries from one call to the next except
+/// capacity: its buffers grow to the widest call they have served and never shrink, so once warm a
+/// worker allocates nothing. Two ranges running at once need two workers.
+#[derive(Debug, Default)]
+pub struct CrowdWorker {
+    scratch: OrcaScratch,
     /// Reused candidate buffer: `(distance, key, index)`, cut to the nearest `max_neighbours` and sorted
     /// nearest-first before use.
     near: Vec<(f32, u64, usize)>,
@@ -114,8 +133,73 @@ pub struct Crowd {
     neighbours: Vec<Agent>,
     /// Reused wall buffer, filled by the caller's `walls` closure.
     walls: Vec<(Vec2, f32)>,
-    /// Reused output, indexed like the members slice.
-    out: Vec<Option<Vec2>>,
+}
+
+/// One step of a crowd, ready to be solved in ranges: what [`Crowd::begin`] returns once the serial
+/// part (the neighbour grid) is built.
+///
+/// It is a read-only view of the members, the grid and the step's parameters, so it is `Copy`, `Send`
+/// and `Sync`: every task of a thread pool can hold one, and each calls
+/// [`solve_range`](Self::solve_range) on its own slice of the output with its own [`CrowdWorker`]. The
+/// crate starts no thread and takes no lock; where the ranges run, and how many, is the caller's.
+///
+/// **The split changes no velocity.** A member's answer is a function of the frozen members, the grid
+/// built from them, and the caller's `sees` and `walls` for that member; no member's solve reads
+/// another's answer, and nothing is summed across members. So any partition of the members into ranges,
+/// solved in any order by any number of workers, gives slot for slot the bits [`Crowd::solve`] gives
+/// (provided `sees` and `walls` are themselves functions of the indices they are given).
+///
+/// ```
+/// use bevy_math::Vec2;
+/// use bevy_orca::{Crowd, CrowdMember, CrowdParams, CrowdWorker};
+///
+/// // A thousand walkers in a block, all heading east.
+/// let members: Vec<CrowdMember> = (0..1000)
+///     .map(|i| CrowdMember {
+///         key: i,
+///         pos: Vec2::new((i % 40) as f32, (i / 40) as f32) * 0.7,
+///         vel: Vec2::ZERO,
+///         radius: 0.3,
+///         max_speed: 1.3,
+///         pref_vel: Some(Vec2::X),
+///     })
+///     .collect();
+/// let params = CrowdParams::new(3.0);
+/// let dt = 1.0 / 30.0;
+///
+/// // The serial part, once; then four workers deal the ranges out between them.
+/// let mut crowd = Crowd::default();
+/// let mut workers: Vec<CrowdWorker> = (0..4).map(|_| CrowdWorker::default()).collect();
+/// let mut solved = vec![None; members.len()];
+/// let step = crowd.begin(&members, &params, dt);
+/// let mut lanes: Vec<Vec<(usize, &mut [Option<Vec2>])>> = (0..4).map(|_| Vec::new()).collect();
+/// for (c, slice) in solved.chunks_mut(128).enumerate() {
+///     lanes[c % 4].push((c * 128, slice));
+/// }
+/// std::thread::scope(|scope| {
+///     for (worker, lane) in workers.iter_mut().zip(lanes) {
+///         scope.spawn(move || {
+///             for (first, slice) in lane {
+///                 step.solve_range(worker, first, slice, |_, _| true, |_, _| {});
+///             }
+///         });
+///     }
+/// });
+///
+/// // The same bits the serial solve gives.
+/// let mut serial = Crowd::default();
+/// assert_eq!(serial.solve(&members, &params, dt, |_, _| true, |_, _| {}), &solved[..]);
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub struct CrowdStep<'a> {
+    obstacles: Option<&'a Obstacles>,
+    members: &'a [CrowdMember],
+    params: CrowdParams,
+    dt: f32,
+    /// [`Crowd`]'s grid, built for `members`.
+    cells: &'a [(u64, usize)],
+    /// [`steers`] of each member, built with the grid.
+    steered: &'a [bool],
 }
 
 /// One cell of the neighbour grid as `(column, row)`, or `None` when the position is not finite. A
@@ -184,6 +268,36 @@ fn steers(m: &CrowdMember) -> bool {
     usable_speed(m.max_speed) && wish(m).is_some()
 }
 
+/// Rebuild the grid: one entry per member that can be a neighbour, sorted by cell, and each member's
+/// [`steers`] flag. The pairs are unique, so the sorted order is fully determined, and the buffers are
+/// cleared rather than dropped, so a warm `Crowd` allocates nothing here however far its members have
+/// walked. A member with no usable state has no velocity obstacle, so it is left out here rather than
+/// taking a neighbour's place only to be skipped by the solver. A `range` that is not a usable cell
+/// width leaves both empty: nobody has neighbours.
+fn build_grid(cells: &mut Vec<(u64, usize)>, steered: &mut Vec<bool>, members: &[CrowdMember], range: f32) {
+    cells.clear();
+    steered.clear();
+    if !searchable(range) {
+        return;
+    }
+    for (i, m) in members.iter().enumerate() {
+        steered.push(steers(m));
+        if !usable_state(m.pos, m.vel, m.radius) {
+            continue;
+        }
+        if let Some((column, row)) = cell_of(m.pos, range) {
+            cells.push((cell_key(i64::from(column), i64::from(row)), i));
+        }
+    }
+    cells.sort_unstable();
+}
+
+/// Whether `range` can be a grid cell's width: finite and positive.
+#[inline]
+fn searchable(range: f32) -> bool {
+    range > 0.0 && range.is_finite()
+}
+
 impl Crowd {
     /// Solve every steered member of `members` for one step of `dt`.
     ///
@@ -208,7 +322,8 @@ impl Crowd {
     ///
     /// Static geometry that does not change from step to step belongs in an [`Obstacles`] and
     /// [`solve_around`](Self::solve_around), which does everything this does and derives the
-    /// half-planes from the geometry.
+    /// half-planes from the geometry. To spread the step over threads, [`begin`](Self::begin) and
+    /// [`CrowdStep::solve_range`] do the same solve in ranges.
     pub fn solve(
         &mut self,
         members: &[CrowdMember],
@@ -241,44 +356,97 @@ impl Crowd {
         self.solve_with(Some(obstacles), members, params, dt, sees, walls)
     }
 
-    /// The one solve, with or without obstacles.
+    /// Build the neighbour grid for one step of `dt` and return it as a [`CrowdStep`], whose
+    /// [`solve_range`](CrowdStep::solve_range) solves the members, in as many ranges, on as many
+    /// threads, as the caller likes. This is the whole serial part of [`solve`](Self::solve); the rest
+    /// is per-member work no member's answer depends on.
+    ///
+    /// The step borrows this `Crowd` and `members` for as long as it lives, so the members cannot
+    /// change, nor a second step begin on this crowd, while ranges are being solved.
+    pub fn begin<'a>(
+        &'a mut self,
+        members: &'a [CrowdMember],
+        params: &CrowdParams,
+        dt: f32,
+    ) -> CrowdStep<'a> {
+        self.begin_with(None, members, params, dt)
+    }
+
+    /// [`begin`](Self::begin) among static [`Obstacles`]: the step's ranges cast the same hard obstacle
+    /// lines [`solve_around`](Self::solve_around) does.
+    pub fn begin_around<'a>(
+        &'a mut self,
+        obstacles: &'a Obstacles,
+        members: &'a [CrowdMember],
+        params: &CrowdParams,
+        dt: f32,
+    ) -> CrowdStep<'a> {
+        self.begin_with(Some(obstacles), members, params, dt)
+    }
+
+    fn begin_with<'a>(
+        &'a mut self,
+        obstacles: Option<&'a Obstacles>,
+        members: &'a [CrowdMember],
+        params: &CrowdParams,
+        dt: f32,
+    ) -> CrowdStep<'a> {
+        build_grid(&mut self.cells, &mut self.steered, members, params.neighbour_range);
+        CrowdStep { obstacles, members, params: *params, dt, cells: &self.cells, steered: &self.steered }
+    }
+
+    /// The one serial solve, with or without obstacles: the grid, then every member as one range.
     fn solve_with(
         &mut self,
         obstacles: Option<&Obstacles>,
         members: &[CrowdMember],
         params: &CrowdParams,
         dt: f32,
-        mut sees: impl FnMut(usize, usize) -> bool,
-        mut walls: impl FnMut(usize, &mut Vec<(Vec2, f32)>),
+        sees: impl FnMut(usize, usize) -> bool,
+        walls: impl FnMut(usize, &mut Vec<(Vec2, f32)>),
     ) -> &[Option<Vec2>] {
-        let range = params.neighbour_range;
-        let search = range > 0.0 && range.is_finite();
-
-        // Rebuild the grid: one entry per member that can be a neighbour, sorted by cell. The pairs are
-        // unique, so the sorted order is fully determined, and the buffer is cleared rather than
-        // dropped, so a warm `Crowd` allocates nothing here however far its members have walked. A
-        // member with no usable state has no velocity obstacle, so it is left out here rather than
-        // taking a neighbour's place only to be skipped by the solver.
-        self.cells.clear();
-        self.steered.clear();
-        if search {
-            for (i, m) in members.iter().enumerate() {
-                self.steered.push(steers(m));
-                if !usable_state(m.pos, m.vel, m.radius) {
-                    continue;
-                }
-                if let Some((column, row)) = cell_of(m.pos, range) {
-                    self.cells.push((cell_key(i64::from(column), i64::from(row)), i));
-                }
-            }
-            self.cells.sort_unstable();
-        }
-
+        build_grid(&mut self.cells, &mut self.steered, members, params.neighbour_range);
         self.out.clear();
         self.out.resize(members.len(), None);
+        let step =
+            CrowdStep { obstacles, members, params: *params, dt, cells: &self.cells, steered: &self.steered };
+        step.solve_range(&mut self.worker, 0, &mut self.out, sees, walls);
+        &self.out
+    }
+}
 
-        for i in 0..members.len() {
-            let m = members[i];
+impl CrowdStep<'_> {
+    /// Solve members `first .. first + out.len()` and write each answer to `out`: `out[k]` is member
+    /// `first + k`, exactly what [`Crowd::solve`] returns for it (`None` when it is not solved, see
+    /// there). A slot past the last member is `None`. Calls for disjoint ranges may run at the same
+    /// time, on different threads, each with its own `worker` and its own slice of the output; calls
+    /// for overlapping ranges are harmless and give the same answers twice.
+    ///
+    /// `sees(i, j)` and `walls(i, &mut buf)` are as in [`Crowd::solve`], and the indices they are
+    /// given are indices into the `members` the step was begun with, not into the range. Each call takes
+    /// its own closures, so a closure may capture a `&mut` counter of its own; a closure whose answer
+    /// depends on which call asked, or when, makes the answer depend on the split, which is the
+    /// caller's choice to make.
+    pub fn solve_range(
+        &self,
+        worker: &mut CrowdWorker,
+        first: usize,
+        out: &mut [Option<Vec2>],
+        mut sees: impl FnMut(usize, usize) -> bool,
+        mut walls: impl FnMut(usize, &mut Vec<(Vec2, f32)>),
+    ) {
+        let (members, params, dt) = (self.members, &self.params, self.dt);
+        let range = params.neighbour_range;
+        let search = searchable(range);
+
+        for (k, slot) in out.iter_mut().enumerate() {
+            *slot = None;
+            let Some(i) = first.checked_add(k) else {
+                continue;
+            };
+            let Some(&m) = members.get(i) else {
+                continue;
+            };
             let Some(pref) = wish(&m) else {
                 continue;
             };
@@ -286,7 +454,7 @@ impl Crowd {
             // Neighbours: every member within `range` that this one sees, nearest first, at most
             // `max_neighbours` of them. Ordering by `(distance, key)` is what makes the result a
             // property of the world rather than of the input slice's order.
-            self.near.clear();
+            worker.near.clear();
             if search && let Some((cx, cy)) = cell_of(m.pos, range) {
                 // The 3×3 block around this member's cell, one row at a time: a row's three cells are
                 // one key range. Neighbouring rows and columns are taken in `i64` and kept inside the
@@ -305,13 +473,15 @@ impl Crowd {
                         if j == i {
                             continue;
                         }
-                        let other = members[j];
+                        let Some(other) = members.get(j) else {
+                            continue;
+                        };
                         let dist = other.pos.distance(m.pos);
                         if dist > range {
                             continue;
                         }
                         if sees(i, j) {
-                            self.near.push((dist, other.key, j));
+                            worker.near.push((dist, other.key, j));
                         }
                     }
                 }
@@ -319,12 +489,14 @@ impl Crowd {
             // Only the nearest `max_neighbours` are used, so only they are ordered; a packed crowd
             // offers hundreds of candidates, and a stable sort would take a heap scratch for each
             // member above 170 of them.
-            nearest(&mut self.near, params.max_neighbours);
+            nearest(&mut worker.near, params.max_neighbours);
 
-            self.neighbours.clear();
-            for &(_, _, j) in &self.near {
-                let other = members[j];
-                self.neighbours.push(Agent {
+            worker.neighbours.clear();
+            for &(_, _, j) in &worker.near {
+                let Some(other) = members.get(j) else {
+                    continue;
+                };
+                worker.neighbours.push(Agent {
                     pos: other.pos,
                     vel: other.vel,
                     radius: other.radius,
@@ -339,42 +511,39 @@ impl Crowd {
             // keeps to one side. A kick the wish cannot take — the sum is not finite, as for a wish near
             // `f32::MAX` — is not applied: such a wish is a direction already, and `new_velocity_in`
             // would refuse the non-finite sum.
-            let wish = if self.near.is_empty() {
+            let wish = if worker.near.is_empty() {
                 pref
             } else {
                 let kicked = pref - pref.perp() * params.nudge;
                 if kicked.is_finite() { kicked } else { pref }
             };
 
-            self.walls.clear();
-            walls(i, &mut self.walls);
+            worker.walls.clear();
+            walls(i, &mut worker.walls);
 
             let me = Agent { pos: m.pos, vel: m.vel, radius: m.radius, avoids: true };
             // The obstacle lines come after the caller's own walls and are never relaxed, like them.
-            if let Some(obstacles) = obstacles {
+            if let Some(obstacles) = self.obstacles {
                 obstacles.push_walls(
-                    &mut self.scratch,
+                    &mut worker.scratch,
                     &me,
                     m.max_speed,
                     // Not shorter than the step: a horizon under `dt` lets a member cross a wall within it.
                     params.obstacle_horizon.max(dt),
-                    &mut self.walls,
+                    &mut worker.walls,
                 );
             }
-            let solved = new_velocity_in(
-                &mut self.scratch,
+            *slot = Some(new_velocity_in(
+                &mut worker.scratch,
                 &me,
                 wish,
-                &self.neighbours,
-                &self.walls,
+                &worker.neighbours,
+                &worker.walls,
                 params.time_horizon,
                 dt,
                 m.max_speed,
-            );
-            self.out[i] = Some(solved);
+            ));
         }
-
-        &self.out
     }
 }
 
@@ -980,6 +1149,175 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `n` members in a 12 m square, so each has a dozen neighbours at a 3 m range and some stand by
+    /// the boxes of [`split_obstacles`]: about one in nine has one hostile field (not finite, huge,
+    /// tiny, negative or zero), and one in nine is not steered.
+    fn split_crowd(seed: u64, n: usize) -> Vec<CrowdMember> {
+        use crate::tests::HOSTILE;
+        let mut state = seed.wrapping_mul(0x9E37_79B9);
+        let mut next = || {
+            state = state.wrapping_add(1);
+            (splitmix64(state) >> 40) as f32 / (1u64 << 24) as f32
+        };
+        (0..n)
+            .map(|i| {
+                let mut m = CrowdMember {
+                    // Keys are scrambled, so key order is neither slice order nor position order.
+                    key: splitmix64(i as u64 ^ seed) % 1000,
+                    pos: Vec2::new(next() * 12.0, next() * 12.0),
+                    vel: Vec2::new(next() * 3.0 - 1.5, next() * 3.0 - 1.5),
+                    radius: 0.2 + next() * 0.3,
+                    max_speed: 0.5 + next() * 1.5,
+                    pref_vel: Some(Vec2::new(next() * 3.0 - 1.5, next() * 3.0 - 1.5)),
+                };
+                let hostile = HOSTILE[((next() * HOSTILE.len() as f32) as usize).min(HOSTILE.len() - 1)];
+                match (next() * 9.0) as usize {
+                    0 => m.pos.x = hostile,
+                    1 => m.vel.y = hostile,
+                    2 => m.radius = hostile,
+                    3 => m.max_speed = hostile,
+                    4 => m.pref_vel = Some(Vec2::new(hostile, 1.0)),
+                    5 => m.pref_vel = None,
+                    _ => {}
+                }
+                m
+            })
+            .collect()
+    }
+
+    /// Two boxes inside [`split_crowd`]'s square and a wall along its edge.
+    fn split_obstacles() -> Obstacles {
+        use crate::ObstaclesBuilder;
+        let mut builder = ObstaclesBuilder::new();
+        builder.add_box(Vec2::new(4.0, 4.0), Vec2::new(1.0, 1.5)).expect("a box");
+        builder.add_box(Vec2::new(8.5, 7.0), Vec2::new(1.5, 0.5)).expect("a box");
+        builder.add_wall(Vec2::new(0.0, 12.0), Vec2::new(12.0, 12.0)).expect("a wall");
+        builder.build().expect("the obstacles build")
+    }
+
+    /// The bits of a solved slice, so `-0.0` against `0.0` and any NaN payload count as differences.
+    fn bits(solved: &[Option<Vec2>]) -> Vec<Option<(u32, u32)>> {
+        solved.iter().map(|v| v.map(|v| (v.x.to_bits(), v.y.to_bits()))).collect()
+    }
+
+    /// The split changes no velocity, which is what `begin` and `solve_range` are for. Over random
+    /// crowds with hostile and unsteered members, a `sees` rule, caller walls and obstacles, every
+    /// partition of the members into ranges (one member each, seven, sixty-four, all), solved in reverse
+    /// order with the workers dealt in turn, over a slice that starts full of stale answers, gives bit for
+    /// bit what `solve` and `solve_around` give — and so does the same thing on three real threads.
+    #[test]
+    fn any_split_of_a_step_gives_the_serial_answers() {
+        let obstacles = split_obstacles();
+        let mut params = CrowdParams::new(3.0);
+        params.max_neighbours = 6;
+        let dt = 1.0 / 30.0;
+        let sees = |i: usize, j: usize| (i * 7 + j * 3) % 11 != 4;
+        let walls = |i: usize, buf: &mut Vec<(Vec2, f32)>| {
+            if i.is_multiple_of(3) {
+                buf.push((Vec2::new(0.0, -1.0), 0.4));
+            }
+        };
+        let stale = Some(Vec2::new(9.0, 9.0));
+        for seed in 0..6u64 {
+            for n in [0usize, 1, 2, 9, 120, 400] {
+                let members = split_crowd(seed, n);
+                for around in [false, true] {
+                    let mut serial = Crowd::default();
+                    let want = if around {
+                        bits(serial.solve_around(&obstacles, &members, &params, dt, sees, walls))
+                    } else {
+                        bits(serial.solve(&members, &params, dt, sees, walls))
+                    };
+                    for chunk in [1usize, 7, 64, 1000] {
+                        let mut crowd = Crowd::default();
+                        let mut workers: Vec<CrowdWorker> = (0..3).map(|_| CrowdWorker::default()).collect();
+                        let step = if around {
+                            crowd.begin_around(&obstacles, &members, &params, dt)
+                        } else {
+                            crowd.begin(&members, &params, dt)
+                        };
+
+                        let mut got = vec![stale; n];
+                        let starts: Vec<usize> = (0..n).step_by(chunk).rev().collect();
+                        for (c, &first) in starts.iter().enumerate() {
+                            let slice = &mut got[first..(first + chunk).min(n)];
+                            step.solve_range(&mut workers[c % 3], first, slice, sees, walls);
+                        }
+                        assert_eq!(
+                            bits(&got),
+                            want,
+                            "seed {seed}, {n} members, chunks of {chunk}, around {around}"
+                        );
+
+                        let mut threaded = vec![stale; n];
+                        type Lane<'a> = Vec<(usize, &'a mut [Option<Vec2>])>;
+                        let mut lanes: Vec<Lane> = (0..3).map(|_| Vec::new()).collect();
+                        for (c, slice) in threaded.chunks_mut(chunk).enumerate() {
+                            lanes[c % 3].push((c * chunk, slice));
+                        }
+                        std::thread::scope(|scope| {
+                            for (worker, lane) in workers.iter_mut().zip(lanes) {
+                                scope.spawn(move || {
+                                    for (first, slice) in lane {
+                                        step.solve_range(worker, first, slice, sees, walls);
+                                    }
+                                });
+                            }
+                        });
+                        assert_eq!(
+                            bits(&threaded),
+                            want,
+                            "seed {seed}, {n} members, threaded chunks of {chunk}, around {around}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A range is the caller's, and an unusable one is answered, never panicked on: a slot past the last
+    /// member (or one whose index would overflow) is `None` and overwrites what was there, an empty slice
+    /// is nothing to do, and a member that is not solved clears its stale slot too.
+    #[test]
+    fn a_range_past_the_members_leaves_the_extra_slots_unsolved() {
+        let params = CrowdParams::new(4.0);
+        let dt = 1.0 / 60.0;
+        let members = [
+            member(1, Vec2::new(-1.0, 0.0), Vec2::new(1.0, 0.0), Some(Vec2::X)),
+            member(2, Vec2::new(1.0, 0.0), Vec2::new(-1.0, 0.0), Some(-Vec2::X)),
+            member(3, Vec2::new(0.0, 3.0), Vec2::ZERO, None),
+        ];
+        let mut crowd = Crowd::default();
+        let want = crowd.solve(&members, &params, dt, |_, _| true, |_, _| {}).to_vec();
+        assert!(want[0].is_some() && want[1].is_some() && want[2].is_none());
+
+        let mut worker = CrowdWorker::default();
+        let step = crowd.begin(&members, &params, dt);
+        let stale = Some(Vec2::new(9.0, 9.0));
+        let mut out = [stale; 6];
+        step.solve_range(&mut worker, 1, &mut out, |_, _| true, |_, _| {});
+        assert_eq!(&out[..2], &want[1..], "members 1 and 2, the unsteered one cleared");
+        assert!(out[2..].iter().all(Option::is_none), "slots past the last member are unsolved: {out:?}");
+
+        for first in [usize::MAX, usize::MAX - 1, 3] {
+            let mut out = [stale; 3];
+            step.solve_range(&mut worker, first, &mut out, |_, _| true, |_, _| {});
+            assert!(out.iter().all(Option::is_none), "first {first}: {out:?}");
+        }
+        step.solve_range(&mut worker, 0, &mut [], |_, _| true, |_, _| {});
+    }
+
+    /// A host's task pool needs the step shared between tasks and a worker moved into one (Bevy's
+    /// `Scope::spawn` takes `Future + 'scope + Send`): compile-time, so a field that is not thread-safe
+    /// breaks the build here and not the host's.
+    #[test]
+    fn a_step_is_shared_and_a_worker_is_sent() {
+        fn send_sync<T: Send + Sync + Copy>() {}
+        fn send<T: Send>() {}
+        send_sync::<CrowdStep<'static>>();
+        send::<CrowdWorker>();
     }
 
     /// A packed knot is the over-constrained step where the linear program relaxes its constraints,

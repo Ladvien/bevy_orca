@@ -35,7 +35,7 @@
 pub mod crowd;
 pub mod obstacles;
 
-pub use crowd::{Crowd, CrowdMember, CrowdParams};
+pub use crowd::{Crowd, CrowdMember, CrowdParams, CrowdStep, CrowdWorker};
 pub use obstacles::{ObstacleError, Obstacles, ObstaclesBuilder};
 
 use bevy_math::Vec2;
