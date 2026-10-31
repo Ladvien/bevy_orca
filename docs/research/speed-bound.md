@@ -58,7 +58,7 @@ What this does not promise: a neighbour whose own state is already ≥ 10⁸ m/s
 |---|---|---|
 | `EPSILON` (parallel test) | `1e-5`, unchanged | RVO2's `RVO_EPSILON` |
 | speed-bound tolerance in tests | `1 + 1e-6` relative | f32 rounding of `c² + t²` (a few ulps of `2⁻²⁴`); design default. Detour allows an absolute `0.001`. |
-| wall normal | normalized before use if the cost is under 1% of a solve (measured below) | design default; the refusal test (`is_normalized`) is unchanged |
+| wall normal | divided by its length before use | design default, kept because it cost nothing measurable: new against new-without-it in the paired harness, −1.5% to +1.1% by scene and size (+1.0% only at the 100-agent corridor, two walls per agent, three rounds); the refusal test (`is_normalized`) is unchanged |
 
 ## Validation targets
 
@@ -78,7 +78,8 @@ A game developer sets `max_speed = 1.4` for a villager and never sees one leave 
 - **From RVO2: where a line is stored.** RVO2 keeps each line through the point it was constructed from and builds each projected line through the intersection of two lines; here every line is stored at its point nearest the origin and projected lines are built from the two lines' offsets. The half-planes and the algorithm are RVO2's; the function names are kept. RVO2's own answer leaves the disc by up to 63.98× on random packs (measured this pass, above). Credited in `NOTICE`.
 - **From RVO2: the anti-parallel projection.** RVO2 places the projected line of two anti-parallel lines through their midpoint; here the same offset formula gives the exact equal-violation bisector, which is the midpoint line when the lines are exactly anti-parallel.
 - **From RVO2: a neighbour line with no direction.** A neighbour whose relative velocity is within `EPSILON` of the cutoff circle's centre has a zero direction (`w_length ≤ EPSILON`, `unit_w = 0`) and no constraint of its own. RVO2's projection against it is an arbitrary line along `−d_i` through a midpoint; here it is line *i*'s own bisector (its violation is identically zero, so "equal violation" says line *i* must not be violated). Neither is derived from the model; the case is a degenerate input, and the speed bound holds for both.
-- **Wall normals are normalized** (if kept; see Parameters) before the wall's line is built. A normal inside `is_normalized`'s tolerance but not unit used to scale the half-plane by `|b|²` (up to `1 ± 2e-4`); the wall is then exactly `v · b̂ ≤ approach`.
+- **Wall normals are normalized** before the wall's line is built. A normal inside `is_normalized`'s tolerance but not unit used to scale the half-plane by `|b|²` (up to `1 ± 2e-4`); the wall is now exactly `v · b̂ ≤ approach` and the speed bound holds for it too.
+- **A `max_speed` whose square is not a normal number is refused** (below about `1.1e-19`, `Vec2::ZERO`), as one whose square overflows already was. Not in the pass-1 draft: this pass's hostile sweep found it (169 of 2 623 solves with `max_speed < 1e-15` over the bound, up to 117×: the disc test compared with a square that rounded to zero). The refusal is `usable_speed`'s, which `Crowd::steers` shares, so a member so limited is avoided in full like any member that will not move.
 
 ## Pending index
 
