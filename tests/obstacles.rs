@@ -657,3 +657,153 @@ fn an_agent_touching_a_wall_within_rounding_cannot_walk_into_it() {
     }
     assert!(worst <= ROUNDING, "a touching walker went {worst} into the wall in one step");
 }
+
+/// The lines are hard: whatever the crowd does to a member, the velocity it is given satisfies every
+/// obstacle line cast on it, to rounding. (A host's own `f32` positions, summed step after step at a
+/// coordinate of a hundred metres, can still lose a few `1e-5` m a step; this is the solver's half.)
+#[test]
+fn every_answer_satisfies_every_obstacle_line() {
+    let mut solids = Vec::new();
+    for i in 0..4 {
+        for j in 0..4 {
+            solids.push(Solid::Box {
+                centre: v(i as f32 * 12.0 + 6.0, j as f32 * 12.0 + 6.0),
+                half: v(4.0, 4.0),
+            });
+        }
+    }
+    solids.push(Solid::Wall { a: v(-2.0, -2.0), b: v(50.0, -2.0) });
+    let obstacles = obstacles_of(&solids);
+    let params = CrowdParams::new(3.0);
+    let mut crowd = Crowd::default();
+    let mut counter = 21u64;
+    let mut agents: Vec<(Vec2, Vec2, Vec2)> = (0..260)
+        .map(|_| {
+            let street = (draw(&mut counter) % 5) as f32 * 12.0;
+            let along = unit(&mut counter) * 48.0;
+            let pos = if draw(&mut counter).is_multiple_of(2) { v(along, street) } else { v(street, along) };
+            let goal = v(unit(&mut counter) * 48.0, unit(&mut counter) * 48.0);
+            (pos + v(unit(&mut counter) - 0.5, unit(&mut counter) - 0.5), Vec2::ZERO, goal)
+        })
+        .collect();
+    let (mut lines, mut worst) = (0usize, 0.0f32);
+    let mut scratch = OrcaScratch::default();
+    for _ in 0..300 {
+        let members: Vec<CrowdMember> = agents
+            .iter()
+            .enumerate()
+            .map(|(i, &(pos, vel, goal))| CrowdMember {
+                key: i as u64,
+                pos,
+                vel,
+                radius: RADIUS,
+                max_speed: SPEED,
+                pref_vel: Some((goal - pos).clamp_length_max(SPEED)),
+            })
+            .collect();
+        let solved = crowd.solve_around(&obstacles, &members, &params, DT, |_, _| true, |_, _| {}).to_vec();
+        for (member, answer) in members.iter().zip(&solved) {
+            let answer = answer.expect("solved");
+            let agent = Agent { pos: member.pos, vel: member.vel, radius: RADIUS, avoids: true };
+            let mut walls = Vec::new();
+            obstacles.push_walls(&mut scratch, &agent, SPEED, params.obstacle_horizon, &mut walls);
+            for &(normal, c) in &walls {
+                lines += 1;
+                worst = worst.max(answer.dot(normal) - c);
+            }
+        }
+        for (agent, answer) in agents.iter_mut().zip(&solved) {
+            agent.1 = answer.expect("solved");
+            let moved = agent.1 * DT;
+            agent.0 += moved;
+        }
+    }
+    assert!(lines > 5_000, "only {lines} obstacle lines were cast: the crowd never met a wall");
+    assert!(worst <= 1.0e-4, "a velocity broke a hard obstacle line by {worst}");
+}
+
+/// A horizon shorter than the step is raised to it: with `dt = 1 s` and an obstacle horizon of 50 ms a
+/// walker 0.7 m from a wall, running at it at 1.5 m/s, would cross it in the step (it looks 0.375 m
+/// ahead and sees nothing). It stops at the face instead.
+#[test]
+fn an_obstacle_horizon_shorter_than_the_step_is_raised_to_it() {
+    let wall = [Solid::Box { centre: v(2.0, 0.0), half: v(1.0, 5.0) }];
+    let obstacles = obstacles_of(&wall);
+    let params = CrowdParams { obstacle_horizon: 0.05, ..CrowdParams::new(3.0) };
+    let mut crowd = Crowd::default();
+    let member = CrowdMember {
+        key: 0,
+        pos: v(1.0 - RADIUS - 0.4, 0.0),
+        vel: Vec2::ZERO,
+        radius: RADIUS,
+        max_speed: SPEED,
+        pref_vel: Some(v(SPEED, 0.0)),
+    };
+    let dt = 1.0;
+    let answer =
+        crowd.solve_around(&obstacles, &[member], &params, dt, |_, _| true, |_, _| {})[0].expect("solved");
+    let after = member.pos + answer * dt;
+    assert!(
+        deepest(&wall, &[after]) <= ROUNDING,
+        "the walker ended the step {} inside the wall",
+        deepest(&wall, &[after])
+    );
+    assert!(answer.x > 0.3, "and it still closed on the face: {answer:?}");
+}
+
+/// A building with a courtyard is a solid with an enclosure inside it: walkers in the courtyard cannot
+/// leave it and walkers outside cannot enter the building, however they are aimed.
+#[test]
+fn a_courtyard_is_an_enclosure_inside_a_solid() {
+    let outer = [v(-10.0, -10.0), v(10.0, -10.0), v(10.0, 10.0), v(-10.0, 10.0)];
+    let inner = [v(-5.0, -5.0), v(5.0, -5.0), v(5.0, 5.0), v(-5.0, 5.0)];
+    let mut builder = ObstaclesBuilder::new();
+    builder.add_solid(&outer).expect("the building");
+    builder.add_enclosure(&inner).expect("the courtyard");
+    let obstacles = builder.build().expect("valid");
+    let params = CrowdParams::new(3.0);
+    let mut crowd = Crowd::default();
+    let mut counter = 5u64;
+    // 24 in the courtyard wishing to go out (far away at a random bearing), 24 outside wishing to go to the middle.
+    let mut agents: Vec<(Vec2, Vec2, Vec2, bool)> = Vec::new();
+    for _ in 0..24 {
+        let (angle, far) = (unit(&mut counter) * core::f32::consts::TAU, v(0.0, 0.0));
+        let pos = v(unit(&mut counter) * 8.0 - 4.0, unit(&mut counter) * 8.0 - 4.0);
+        agents.push((pos, Vec2::ZERO, far + v(angle.cos(), angle.sin()) * 60.0, true));
+    }
+    for _ in 0..24 {
+        let angle = unit(&mut counter) * core::f32::consts::TAU;
+        let pos = v(angle.cos(), angle.sin()) * (14.0 + unit(&mut counter) * 6.0);
+        agents.push((pos, Vec2::ZERO, Vec2::ZERO, false));
+    }
+    let (mut worst_in, mut worst_out) = (0.0f32, 0.0f32);
+    for _ in 0..600 {
+        let members: Vec<CrowdMember> = agents
+            .iter()
+            .enumerate()
+            .map(|(i, &(pos, vel, goal, _))| CrowdMember {
+                key: i as u64,
+                pos,
+                vel,
+                radius: RADIUS,
+                max_speed: SPEED,
+                pref_vel: Some((goal - pos).clamp_length_max(SPEED)),
+            })
+            .collect();
+        let solved = crowd.solve_around(&obstacles, &members, &params, DT, |_, _| true, |_, _| {});
+        for (agent, s) in agents.iter_mut().zip(solved) {
+            agent.1 = s.expect("solved");
+            let moved = agent.1 * DT;
+            agent.0 += moved;
+            if agent.3 {
+                worst_in = worst_in.max(agent.0.abs().max_element() + RADIUS - 5.0);
+            } else {
+                // Outside the building: the distance to its square must stay at least the radius.
+                let building = Solid::Box { centre: Vec2::ZERO, half: Vec2::splat(10.0) };
+                worst_out = worst_out.max(RADIUS - building.distance(agent.0));
+            }
+        }
+    }
+    assert!(worst_in <= ROUNDING, "a courtyard walker's disc reached {worst_in} into the building");
+    assert!(worst_out <= ROUNDING, "a walker outside got {worst_out} into the building");
+}

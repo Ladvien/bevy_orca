@@ -1,6 +1,6 @@
 //! **The crowd bench: what one `Crowd::solve` step costs a host, and what it gets right.**
 //!
-//! Five scenes, each at 100, 1 000, 5 000 and 10 000 agents:
+//! Eight scenes, each at 100, 1 000, 5 000 and 10 000 agents:
 //!
 //! - `open` — random walkers at 0.5 agents/m², each walking to goals drawn from its own key;
 //! - `circle` — the circle swap, every agent walking to its antipode, 1 m of ring per agent;
@@ -8,7 +8,15 @@
 //! - `bottleneck` — a room at 1 agent/m² draining through a gap two agents wide in a wall;
 //! - `rally` — units gathered at a rally point: hex-packed 6 cm apart (2.65 agents/m²), every one
 //!   pressing toward the centre, with a 5 m neighbour range, so at 10 000 agents a member has about
-//!   200 others in range to choose its 10 neighbours from.
+//!   200 others in range to choose its 10 neighbours from;
+//! - `bottleneck_obst` — the bottleneck with its two wall pieces as `Obstacles` (RVO2's obstacle
+//!   lines) instead of the host's closest-point half-planes, solved with `Crowd::solve_around`;
+//! - `city` — walkers on Manhattan routes along the streets of a grid of 8 m buildings on a 12 m
+//!   pitch (a quarter of a walker per m² of street), the buildings an `Obstacles`;
+//! - `city_pushout` — the same city the way a host does it without obstacles: nothing in the solve,
+//!   and a walker whose disc ends a step inside a building is put back on its surface (Sanctuary's
+//!   `push_out_of_box`). It also prints `pushed` (agent-steps that needed it) and `push_max` (the
+//!   deepest, in metres).
 //!
 //! Each case runs 20 warm-up steps and 480 timed ones, then prints one line:
 //!
@@ -38,18 +46,21 @@
 //! at constant density: 1.0 is linear.
 //!
 //! A second section, `arrive`, runs the circle swap at 20, 100 and 1 000 agents (1 m of ring per agent)
-//! and at 20 agents on the `circle_swap` example's wider ring, a 100-agent two-way corridor, and the
-//! bottleneck at 100, 200 and 400 agents, each for three times the longest straight-line time. It prints
-//! the fraction that arrived (in the bottleneck, that got through the gap), how many stalled (under 5%
-//! of their preferred speed for more than 2 s, away from their goal), and `t50_s` / `t90_s`, when half
-//! and nine tenths had arrived. The 20 agents on the 1 m ring never arrive: that ring is the tightest
-//! their discs fit, a fixed point of the solver no sideways kick leaves (see the README's known limits).
+//! and at 20 agents on the `circle_swap` example's wider ring, a 100-agent two-way corridor, the
+//! bottleneck and `bottleneck_obst` at 100, 200 and 400 agents, and the city and `city_pushout` at 100
+//! and 1 000 (each walker leaves at its goal), each for three times the longest straight-line time.
+//! It prints the fraction that arrived (in the bottleneck, that got through the gap), how many stalled
+//! (under 5% of their preferred speed for more than 2 s, away from their goal), and `t50_s` / `t90_s`,
+//! when half and nine tenths had arrived. The 20 agents on the 1 m ring never arrive: that ring is the
+//! tightest their discs fit, a fixed point of the solver no sideways kick leaves (see the README's
+//! known limits).
 //!
 //! Knobs: `ORCA_SCENES=open,circle` restricts both sections to those scenes and `ORCA_SIZES=100,1000`
 //! the timing one; `ORCA_ARRIVE=0` skips the arrival section, `ORCA_ARRIVE=only` runs nothing else;
 //! `ORCA_SEED=n` shifts every member's key by `n` (another crowd of the same scene, for a spread);
 //! `ORCA_SERIAL=1` times only the serial forward run, which is all a timing comparison needs, and
-//! leaves the order and thread-count hashes to a full run.
+//! leaves the order and thread-count hashes to a full run; `ORCA_OBST_HORIZON=s` sets
+//! `CrowdParams::obstacle_horizon` for the scenes that have obstacles.
 //!
 //! Run: `cargo run --release --example bench`
 
