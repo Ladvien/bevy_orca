@@ -38,7 +38,7 @@ let v = new_velocity(
 
 **The result is always finite, whatever you hand in.** A paused frame, a first frame or a time-scale of 0 hands in `dt = 0`, a physics blow-up hands in a NaN velocity, and a NaN written into a caller's `Transform` makes its agent vanish for good. So every input the solve cannot use has one documented answer:
 
-- A `max_speed` that is not finite, not positive, or so large its square overflows `f32` gives `Vec2::ZERO`; so does a non-finite preference.
+- A `max_speed` that is not finite, not positive, so large its square overflows `f32` (above about `1.8e19`), or so small its square is not a normal number (below about `1.1e-19`) gives `Vec2::ZERO`; so does a non-finite preference.
 - An agent whose own position or velocity is not finite, or whose radius is negative or not finite, gives `Vec2::ZERO`: it holds still for that step, and once you write the zero back its velocity is usable again. A radius of 0 is a point and is fine.
 - A `dt` or `time_horizon` that is not finite, not positive, or so small its reciprocal overflows gives your preferred velocity, clamped — no time passes, so nothing can be constrained.
 - A wall whose normal is not a unit vector (`Vec2::is_normalized`) or whose approach speed is not finite gives `Vec2::ZERO`. Walls are hard, so one that is not a half-plane holds the agent still rather than being dropped.
@@ -47,6 +47,8 @@ let v = new_velocity(
 A finite preference is always usable, however long. One longer than `max_speed` is clamped to the speed disc along its own direction, and that includes one too long to square (above about `1.8e19`, which `offset / time_left` produces when `time_left` is tiny): the agent runs at full speed that way, it does not stop. `Crowd` follows the same rule for a member's `pref_vel`, and leaves its sideways nudge off a wish so large that the nudge cannot be added.
 
 Finite, in-range input passes every one of these checks, so none of them changes a single bit of a normal solve.
+
+**The result is never faster than `max_speed`**, to `f32` rounding (a relative `1e-6`), for any finite input: in a knot of forty agents, with a neighbour standing on the agent, with a navigator that hands in an own velocity of `1e10`. The speed disc is a constraint of the linear program, not a clamp after it. The reference implementation does not keep this promise: RVO2 (`snape/RVO2`) answers 14 805 of 1.9 million velocities over its `maxSpeed` on random packs of 2 to 40 agents, by up to 64×, and this crate did too (15 616, up to 77×) until every line was stored at its point nearest the origin (see `NOTICE`); packs of the same shape now give none over `1.000001×`, and `bench` prints `speed_max` for every scene so a regression shows.
 
 ## A whole crowd
 
@@ -87,7 +89,7 @@ for (member, v) in members.iter().zip(solved) {
 
 The caller still owns the two gameplay decisions — **who is a neighbour** (`sees`) and **what is solid** (`walls`). `Crowd` only decides how they are found and how they are solved. `key` is what makes the result a property of the world rather than of your iteration order: candidates sort by `(distance, key)`. The side a crowd passes on is not the key's but one number's: `CrowdParams::nudge` kicks every member toward the **same** side of its own wish, the right for a positive value (clockwise in your plane, which is where ORCA's own tie-break sends two agents walking straight at each other) and the left for a negative one, so two agents meeting head-on are kicked past each other and a crowd crossing a crowd turns one way instead of every way.
 
-A member is `None` when it has no preference, its preference is not finite, or its position is not finite. Every other member gets `new_velocity_in`'s answer, so one whose velocity or radius is unusable, or whose `max_speed` is not finite, not positive or so large its square overflows, is solved to `Vec2::ZERO` and holds still; and a member whose position, velocity or radius is unusable is nobody's neighbour and takes none of the `max_neighbours` places.
+A member is `None` when it has no preference, its preference is not finite, or its position is not finite. Every other member gets `new_velocity_in`'s answer, so one whose velocity or radius is unusable, or whose `max_speed` is not finite, not positive, so large its square overflows or so small its square is not a normal number, is solved to `Vec2::ZERO` and holds still; and a member whose position, velocity or radius is unusable is nobody's neighbour and takes none of the `max_neighbours` places.
 
 Reciprocity is assumed only of a neighbour this step moves. A member that is `None`, or that is solved to a stop because its `max_speed` leaves it no velocity (root a unit by setting it to `0.0`, and keep its wish if you like), is avoided in **full** by everyone near it; every other neighbour takes half. The solver's skip and the avoidance flag come from one test, so they cannot disagree.
 

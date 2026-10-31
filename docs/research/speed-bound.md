@@ -58,7 +58,7 @@ What this does not promise: a neighbour whose own state is already ≥ 10⁸ m/s
 |---|---|---|
 | `EPSILON` (parallel test) | `1e-5`, unchanged | RVO2's `RVO_EPSILON` |
 | speed-bound tolerance in tests | `1 + 1e-6` relative | f32 rounding of `c² + t²` (a few ulps of `2⁻²⁴`); design default. Detour allows an absolute `0.001`. |
-| wall normal | normalized before use if the cost is under 1% of a solve (measured below) | design default; the refusal test (`is_normalized`) is unchanged |
+| wall normal | divided by its length before use | design default, kept because it cost nothing measurable: new against new-without-it in the paired harness, −1.5% to +1.1% by scene and size (+1.0% only at the 100-agent corridor, two walls per agent, three rounds); the refusal test (`is_normalized`) is unchanged |
 
 ## Validation targets
 
@@ -78,7 +78,37 @@ A game developer sets `max_speed = 1.4` for a villager and never sees one leave 
 - **From RVO2: where a line is stored.** RVO2 keeps each line through the point it was constructed from and builds each projected line through the intersection of two lines; here every line is stored at its point nearest the origin and projected lines are built from the two lines' offsets. The half-planes and the algorithm are RVO2's; the function names are kept. RVO2's own answer leaves the disc by up to 63.98× on random packs (measured this pass, above). Credited in `NOTICE`.
 - **From RVO2: the anti-parallel projection.** RVO2 places the projected line of two anti-parallel lines through their midpoint; here the same offset formula gives the exact equal-violation bisector, which is the midpoint line when the lines are exactly anti-parallel.
 - **From RVO2: a neighbour line with no direction.** A neighbour whose relative velocity is within `EPSILON` of the cutoff circle's centre has a zero direction (`w_length ≤ EPSILON`, `unit_w = 0`) and no constraint of its own. RVO2's projection against it is an arbitrary line along `−d_i` through a midpoint; here it is line *i*'s own bisector (its violation is identically zero, so "equal violation" says line *i* must not be violated). Neither is derived from the model; the case is a degenerate input, and the speed bound holds for both.
-- **Wall normals are normalized** (if kept; see Parameters) before the wall's line is built. A normal inside `is_normalized`'s tolerance but not unit used to scale the half-plane by `|b|²` (up to `1 ± 2e-4`); the wall is then exactly `v · b̂ ≤ approach`.
+- **Wall normals are normalized** before the wall's line is built. A normal inside `is_normalized`'s tolerance but not unit used to scale the half-plane by `|b|²` (up to `1 ± 2e-4`); the wall is now exactly `v · b̂ ≤ approach` and the speed bound holds for it too.
+- **A `max_speed` whose square is not a normal number is refused** (below about `1.1e-19`, `Vec2::ZERO`), as one whose square overflows already was. Not in the pass-1 draft: this pass's hostile sweep found it (169 of 2 623 solves with `max_speed < 1e-15` over the bound, up to 117×: the disc test compared with a square that rounded to zero). The refusal is `usable_speed`'s, which `Crowd::steers` shares, so a member so limited is avoided in full like any member that will not move.
+
+## Results
+
+Measured at the end of iteration 7 (`/tmp/o7`, removed after the pass; the probes are throwaway crates over copies of `src/`).
+
+| Check | Before (`07c1048`) | After |
+|---|---|---|
+| answers over `1.000001×` (single solves, 4 × 100 000: sane / two coincident neighbours / near-parallel row / fast own velocity) | 2 893 / 5 122 / 309 / 307 | **0 / 0 / 0 / 0** |
+| `Crowd::solve`, 1 896 840 solves in 3 000 packs of 2–40 | 15 616 over `1.000001×`, 701 over `1.001×`, worst 77.45× | **0, 0, worst 1.000000238** (two ulps of f32) |
+| hostile single solves (200 000: NaN, ±∞, `f32::MAX`, subnormal and 1e20 fields, one or many at a time) | 380 over (210 with `max_speed ≥ 1e-15`, worst 3.9e15×) | **0**, none non-finite, none panicked (before: none either) |
+| 40 000 random cases against an f64 brute-force oracle (120 × 120 grid over the disc, 0–2 walls, 1–6 neighbours; 31 719 feasible, 8 277 over-constrained) | 0 infeasible answers, 0 farther than the best sample, 0 worse than the best minimax sample | **the same 0 / 0 / 0**; 18 of 40 000 answers differ from before by more than `1e-3` (5 where the old one stayed in the disc, worst 0.0039), every one of them also passing the oracle |
+| `bench` `speed_max` (all scenes, 100 and 1 000 agents, eight crowds each, measured and arrival runs) | up to **1.438** (open 1 000), 1.062 (open 100), 1.0089 (corridor 1 000), 1.0064 (bottleneck 1 000) | **1.000000** in every run |
+| `bench` hashes, 20 (scene, size) groups × order × 1 / 2 / 14 threads | one hash per group | one hash per group (17 of 20 differ from before: the three that do not are the free-flowing circle at 1 000, 5 000 and 10 000) |
+| walls (`wall_max`), `wall_corridor` | 0.0000, closest 0.800 | 0.0000 in every row and run, `wall_corridor` and `head_on` byte-identical |
+| deepest overlap, mean of eight crowds, before → after (paired difference ± standard error) | | bottleneck 100 0.1122 → 0.1125 (+0.0003 ± 0.0037), 1 000 0.1674 → 0.1753 (+0.0079 ± 0.0106), corridor 100 identical, 1 000 0.0479 → 0.0470, open 100 0.0373 → 0.0410 (+0.0037 ± 0.0025), 1 000 0.0585 → 0.0613 (+0.0027 ± 0.0061); circle 100 0.0639 → 0.0404; rally 100 identical, 1 000 0.0750 → 0.0789. None beyond 1.5 standard errors |
+| arrivals (3× straight-line budget), eight crowds | circle 20 on the 1 m ring 0.000 (20 stalled, the fixed point), 20 wide 1.000, 100 1.000 (t90 34.6 s), 1 000 1.000 (266.4 s), corridor 100 1.000; bottleneck flow 0.617 / 0.448 / 0.286 (100 / 200 / 400) | the same arrivals and zero stalls where there were none; circle 100 t90 33.8 s, 1 000 264.7 s; bottleneck flow 0.611 / 0.448 / 0.300, stalled 11.2 / 44.6 / 92.8 against 14.2 / 41.9 / 82.8 |
+| allocations, `tests/alloc.rs`, warm `Crowd::solve` at 10 000 | 0–2 per case, 5 of 5 | the same per case, 5 of 5 |
+| scaling exponent 1k → 10k (macro bench, median of three) | 0.949 / 1.062 / 1.043 / 0.942 / 1.095 (open / circle / corridor / bottleneck / rally) | 0.980 / 1.061 / 1.033 / 0.926 / 1.084 |
+
+**Cost, paired** (six builds of `Crowd::solve` in one process on one frozen mid-flow crowd — base twice, new twice, new without the wall normalisation twice — rotating order, thread CPU time, median of per-rep ratios; A/A within ±0.7% at 1 000 agents, up to ±2.7% at 100 and in the single 5 000 / 10 000 rounds). `new / base`:
+
+| agents | open | circle | corridor | bottleneck | rally |
+|---|---|---|---|---|---|
+| 100 (3 rounds for circle and corridor, 1 for the rest) | +0.4% | +3.6% | +4.3% | +0.3% | +1.0% |
+| 1 000 (3 rounds) | +0.2% | +2.8% | +1.2% | +0.8% | +1.3% |
+| 5 000 (1 round) | −0.0% | +2.4% | +3.0% | +0.8% | +0.1% |
+| 10 000 (1 round; bottleneck 4) | +0.4% | +1.4% | +1.2% | +2.6% | +2.6% |
+
+Largest: corridor 100 at +4.3% (+4.07, +4.38, +4.44), under the 5% gate. The macro bench cannot resolve this on this host (rally 100 read 410 µs for the base and 175 µs for the new build in the median of three, new/base −58% in two rounds and +1.5% in the third; corridor 1 000 +92% in one round and +2.7% in the next: the laptop mixes fast and slow cores), so its table is kept only as a record: median of three, 20 cases, new against base mean −1.0%, median +1.8%. Candidates per agent are unchanged (the neighbour search is untouched).
 
 ## Pending index
 
