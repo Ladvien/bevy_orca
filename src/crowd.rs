@@ -6,12 +6,14 @@
 //! is deterministic when two agents want the same space, and the wall buffer. This module is that
 //! ring, once, so a host learns it once.
 //!
-//! The caller still decides the two things that are gameplay: **who is a neighbour**
-//! (`solve`'s `sees`) and **what is solid** (its `walls`). This module never looks at a game type.
+//! The caller still decides the things that are gameplay: **who is a neighbour** (`solve`'s `sees`),
+//! **what is solid** (its `walls` closure, for a wall that changes every step, and the
+//! [`Obstacles`] handed to [`Crowd::solve_around`], for geometry that does not) and where everyone
+//! wants to go. This module never looks at a game type.
 
 use bevy_math::Vec2;
 
-use crate::{Agent, OrcaScratch, new_velocity_in, usable_speed, usable_state};
+use crate::{Agent, Obstacles, OrcaScratch, new_velocity_in, usable_speed, usable_state};
 
 /// One member of a crowd, as the batch solver sees it.
 ///
@@ -69,13 +71,21 @@ pub struct CrowdParams {
     /// the wish cannot take — the kicked wish is not finite, as for a wish near `f32::MAX`, or `nudge`
     /// is NaN — is not applied.
     pub nudge: f32,
+    /// Seconds of lookahead against [`Obstacles`], separate from `time_horizon`: only
+    /// [`Crowd::solve_around`] reads it. An agent should not be "shy" of a wall it must pass close
+    /// to in order to avoid another agent, so this is ordinarily shorter than `time_horizon` (the
+    /// ORCA paper's section 5.4; Menge ships 0.15 s against 3 s). It must be at least the step `dt`,
+    /// or an agent can cross a wall within one step. It is also how far an agent looks for walls:
+    /// `obstacle_horizon · max_speed + radius`.
+    pub obstacle_horizon: f32,
 }
 
 impl CrowdParams {
     /// Parameters for a crowd whose neighbours are within `neighbour_range` of each other: a 2-second
-    /// horizon, at most 10 neighbours and a 5% nudge.
+    /// horizon against other members, 0.5 seconds against obstacles, at most 10 neighbours and a 5%
+    /// nudge.
     pub fn new(neighbour_range: f32) -> Self {
-        Self { time_horizon: 2.0, neighbour_range, max_neighbours: 10, nudge: 0.05 }
+        Self { time_horizon: 2.0, neighbour_range, max_neighbours: 10, nudge: 0.05, obstacle_horizon: 0.5 }
     }
 }
 
@@ -194,8 +204,45 @@ impl Crowd {
     /// gameplay rule (same storey, same team, can see through a door). `walls(i, &mut buf)` fills
     /// member `i`'s wall half-planes, exactly as [`new_velocity_in`] takes them; the buffer it is
     /// handed is cleared first and reused afterwards.
+    ///
+    /// Static geometry that does not change from step to step belongs in an [`Obstacles`] and
+    /// [`solve_around`](Self::solve_around), which does everything this does and derives the
+    /// half-planes from the geometry.
     pub fn solve(
         &mut self,
+        members: &[CrowdMember],
+        params: &CrowdParams,
+        dt: f32,
+        sees: impl FnMut(usize, usize) -> bool,
+        walls: impl FnMut(usize, &mut Vec<(Vec2, f32)>),
+    ) -> &[Option<Vec2>] {
+        self.solve_with(None, members, params, dt, sees, walls)
+    }
+
+    /// [`solve`](Self::solve) among static [`Obstacles`]: every member also keeps clear of the
+    /// polygons and walls in `obstacles`, by hard lines that go after the member's `walls` and ahead
+    /// of every neighbour, are never relaxed, and are cast `params.obstacle_horizon` seconds ahead
+    /// (see [`Obstacles::push_walls`]). An empty set gives exactly the answers `solve` gives.
+    ///
+    /// `walls` is still the caller's, for what changes every step (a door that opens); pass
+    /// `|_, _| {}` when there is none. Obstacles make a member avoid, not navigate: the way round a
+    /// building is its `pref_vel`.
+    pub fn solve_around(
+        &mut self,
+        obstacles: &Obstacles,
+        members: &[CrowdMember],
+        params: &CrowdParams,
+        dt: f32,
+        sees: impl FnMut(usize, usize) -> bool,
+        walls: impl FnMut(usize, &mut Vec<(Vec2, f32)>),
+    ) -> &[Option<Vec2>] {
+        self.solve_with(Some(obstacles), members, params, dt, sees, walls)
+    }
+
+    /// The one solve, with or without obstacles.
+    fn solve_with(
+        &mut self,
+        obstacles: Option<&Obstacles>,
         members: &[CrowdMember],
         params: &CrowdParams,
         dt: f32,
@@ -301,6 +348,16 @@ impl Crowd {
             walls(i, &mut self.walls);
 
             let me = Agent { pos: m.pos, vel: m.vel, radius: m.radius, avoids: true };
+            // The obstacle lines come after the caller's own walls and are never relaxed, like them.
+            if let Some(obstacles) = obstacles {
+                obstacles.push_walls(
+                    &mut self.scratch,
+                    &me,
+                    m.max_speed,
+                    params.obstacle_horizon,
+                    &mut self.walls,
+                );
+            }
             let solved = new_velocity_in(
                 &mut self.scratch,
                 &me,
@@ -898,6 +955,7 @@ mod tests {
                 neighbour_range: value(1.0, 4.0),
                 max_neighbours: (step % 7) as usize,
                 nudge: value(0.0, 0.1),
+                obstacle_horizon: value(0.1, 1.0),
             };
             let dt = value(1.0 / 60.0, 0.1);
             let solved = crowd.solve(

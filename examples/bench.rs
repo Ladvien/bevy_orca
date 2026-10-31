@@ -59,7 +59,9 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use bevy_math::Vec2;
-use bevy_orca::{Agent, Crowd, CrowdMember, CrowdParams, OrcaScratch, new_velocity_in};
+use bevy_orca::{
+    Agent, Crowd, CrowdMember, CrowdParams, Obstacles, ObstaclesBuilder, OrcaScratch, new_velocity_in,
+};
 
 const RADIUS: f32 = 0.3;
 const SPEED: f32 = 1.3;
@@ -76,6 +78,13 @@ const GAP: f32 = 1.4;
 const RALLY_RANGE: f32 = 5.0;
 /// Centre-to-centre spacing of the rally's hex lattice: discs 6 cm apart.
 const RALLY_SPACING: f32 = 2.0 * RADIUS + 0.06;
+/// The city scenes: buildings `BLOCK` metres square on a `PITCH` lattice, so the streets between them
+/// are `PITCH - BLOCK` wide, with `STREET_DENSITY` walkers per m² of street.
+const BLOCK: f32 = 8.0;
+const PITCH: f32 = 12.0;
+const STREET_DENSITY: f32 = 0.25;
+/// How far ahead along its street a city walker's wish aims.
+const CARROT: f32 = 3.0;
 
 // ---------------------------------------------------------------------------------------------
 // Allocation counter: per thread, so a worker thread's spawn does not count against the solve.
@@ -162,10 +171,26 @@ enum Scene {
     Corridor,
     Bottleneck,
     Rally,
+    /// The bottleneck's wall as `Obstacles` instead of the host's closest-point half-planes.
+    BottleneckObst,
+    /// Walkers on Manhattan routes through a grid of buildings, which are `Obstacles`.
+    City,
+    /// The same city the way the consumers do it today: nothing in the solve, and a push-out of any
+    /// walker whose disc ends a step inside a building.
+    CityPushout,
 }
 
 impl Scene {
-    const ALL: [Scene; 5] = [Scene::Open, Scene::Circle, Scene::Corridor, Scene::Bottleneck, Scene::Rally];
+    const ALL: [Scene; 8] = [
+        Scene::Open,
+        Scene::Circle,
+        Scene::Corridor,
+        Scene::Bottleneck,
+        Scene::Rally,
+        Scene::BottleneckObst,
+        Scene::City,
+        Scene::CityPushout,
+    ];
 
     fn name(self) -> &'static str {
         match self {
@@ -174,6 +199,9 @@ impl Scene {
             Scene::Corridor => "corridor",
             Scene::Bottleneck => "bottleneck",
             Scene::Rally => "rally",
+            Scene::BottleneckObst => "bottleneck_obst",
+            Scene::City => "city",
+            Scene::CityPushout => "city_pushout",
         }
     }
 
@@ -181,6 +209,19 @@ impl Scene {
     fn range(self) -> f32 {
         if self == Scene::Rally { RALLY_RANGE } else { RANGE }
     }
+
+    fn is_city(self) -> bool {
+        matches!(self, Scene::City | Scene::CityPushout)
+    }
+}
+
+/// `CrowdParams` for a scene. `ORCA_OBST_HORIZON` overrides `obstacle_horizon`, to measure it.
+fn params_for(scene: Scene) -> CrowdParams {
+    let mut params = CrowdParams::new(scene.range());
+    if let Some(h) = std::env::var("ORCA_OBST_HORIZON").ok().and_then(|s| s.parse().ok()) {
+        params.obstacle_horizon = h;
+    }
+    params
 }
 
 /// A convex wall piece: a segment from `a` to `b`.
@@ -196,6 +237,35 @@ impl Segment {
         let t = ((p - self.a).dot(ab) / ab.length_squared()).clamp(0.0, 1.0);
         self.a + ab * t
     }
+}
+
+/// The signed distance from `p` to the building of half extents `half` centred at `centre`: negative
+/// inside.
+fn box_distance(p: Vec2, centre: Vec2, half: Vec2) -> f32 {
+    let d = (p - centre).abs() - half;
+    d.max(Vec2::ZERO).length() + d.x.max(d.y).min(0.0)
+}
+
+/// `p` moved out of the building, to where a disc of `RADIUS` just clears it: Sanctuary's
+/// `push_out_of_box`, the consumers' stand-in for an obstacle in the solve.
+fn push_out_of_box(p: Vec2, centre: Vec2, half: Vec2) -> Vec2 {
+    let d = (p - centre).abs() - half;
+    if d.x < 0.0 && d.y < 0.0 {
+        // Inside: out along the nearer face.
+        let sign = Vec2::new((p.x - centre.x).signum(), (p.y - centre.y).signum());
+        return if d.x > d.y {
+            Vec2::new(centre.x + sign.x * (half.x + RADIUS), p.y)
+        } else {
+            Vec2::new(p.x, centre.y + sign.y * (half.y + RADIUS))
+        };
+    }
+    let outside = d.max(Vec2::ZERO);
+    let distance = outside.length();
+    if distance >= RADIUS {
+        return p;
+    }
+    let nearest = p - Vec2::new((p.x - centre.x).signum() * outside.x, (p.y - centre.y).signum() * outside.y);
+    nearest + (p - nearest) / distance * RADIUS
 }
 
 /// The world a host owns: positions, velocities, goals. `Crowd` sees only the member slice built
@@ -217,6 +287,21 @@ struct World {
     /// The open field's side, or the corridor's length.
     extent: f32,
     segments: Vec<Segment>,
+    /// The static geometry the solve is given (the bottleneck's wall, the city's buildings); empty
+    /// for the scenes that do not use `Obstacles`.
+    obstacles: Obstacles,
+    /// The city: buildings per side, the first waypoint of each walker's route (the second is its
+    /// goal), and which one it is walking to.
+    blocks: usize,
+    route: Vec<Vec2>,
+    /// Each city walker's offset from the middle of the street it walks along.
+    lateral: Vec<f32>,
+    stage: Vec<u8>,
+    /// A city walker leaves at its goal (the arrival section) instead of drawing another.
+    trips: bool,
+    /// The push-out city: agent-steps that ended inside a building, and the deepest of them.
+    pushed: u64,
+    push_max: f32,
 }
 
 impl World {
@@ -232,6 +317,8 @@ impl World {
         let keys: Vec<u64> = (0..n as u64).map(|k| k + seed()).collect();
         let mut extent = 0.0;
         let mut segments = Vec::new();
+        let (mut blocks, mut route, mut lateral) = (0usize, Vec::new(), Vec::new());
+        let mut obstacles = Obstacles::default();
         match scene {
             Scene::Open => {
                 // A jittered grid at 0.5 agents/m², so nobody starts inside anybody.
@@ -274,7 +361,7 @@ impl World {
                     goal.push(Vec2::new(if east { end } else { -end }, y));
                 }
             }
-            Scene::Bottleneck => {
+            Scene::Bottleneck | Scene::BottleneckObst => {
                 // A square room left of the wall at x = 0, one agent per m², on a jittered grid.
                 let side = (n as f32).sqrt().ceil() as usize;
                 let room = side as f32;
@@ -287,6 +374,13 @@ impl World {
                 let far = room + 10.0;
                 segments.push(Segment { a: Vec2::new(0.0, GAP * 0.5), b: Vec2::new(0.0, far) });
                 segments.push(Segment { a: Vec2::new(0.0, -GAP * 0.5), b: Vec2::new(0.0, -far) });
+                if scene == Scene::BottleneckObst {
+                    let mut builder = ObstaclesBuilder::new();
+                    for s in &segments {
+                        builder.add_wall(s.a, s.b).expect("a wall");
+                    }
+                    obstacles = builder.build().expect("two walls");
+                }
             }
             Scene::Rally => {
                 // A hex lattice in a square block centred on the rally point at the origin.
@@ -299,6 +393,45 @@ impl World {
                     let shift = if r % 2 == 1 { RALLY_SPACING * 0.5 } else { 0.0 };
                     pos.push(Vec2::new(c as f32 * RALLY_SPACING + shift, r as f32 * row_step) - centre);
                     goal.push(Vec2::ZERO);
+                }
+            }
+            Scene::City | Scene::CityPushout => {
+                // Buildings on a lattice, streets between them. Walkers start on the horizontal streets
+                // in four lanes, and walk along the street middles: first along their own street to
+                // their goal's column, then along that column to the goal, a street crossing.
+                let street_share = 1.0 - (BLOCK / PITCH) * (BLOCK / PITCH);
+                let k = (((n as f32 / STREET_DENSITY / street_share).sqrt() / PITCH).round() as usize).max(2);
+                blocks = k;
+                extent = k as f32 * PITCH;
+                let streets = k + 1;
+                let per_street = n.div_ceil(streets);
+                let lanes = 4usize;
+                let columns = per_street.div_ceil(lanes);
+                let dx = extent / columns as f32;
+                let usable = PITCH - BLOCK - 2.0 * RADIUS - 0.4;
+                for (i, &key) in keys.iter().enumerate() {
+                    let (street, idx) = (i % streets, i / streets);
+                    let (lane, column) = (idx % lanes, idx / lanes);
+                    let y = street as f32 * PITCH + (lane as f32 - 1.5) * usable / 3.0;
+                    let x = (column as f32 + 0.5) * dx + (unit(key, 3) - 0.5) * 0.2;
+                    pos.push(Vec2::new(x, y));
+                    let g = Vec2::new(
+                        (unit(key, 100) * streets as f32).floor().min(k as f32) * PITCH,
+                        (unit(key, 101) * streets as f32).floor().min(k as f32) * PITCH,
+                    );
+                    goal.push(g);
+                    route.push(Vec2::new(g.x, street as f32 * PITCH));
+                    lateral.push((lane as f32 - 1.5) * usable / 3.0);
+                }
+                if scene == Scene::City {
+                    let mut builder = ObstaclesBuilder::new();
+                    for i in 0..k {
+                        for j in 0..k {
+                            let centre = Vec2::new((i as f32 + 0.5) * PITCH, (j as f32 + 0.5) * PITCH);
+                            builder.add_box(centre, Vec2::splat(BLOCK * 0.5)).expect("a building");
+                        }
+                    }
+                    obstacles = builder.build().expect("buildings");
                 }
             }
         }
@@ -314,6 +447,34 @@ impl World {
             goal,
             extent,
             segments,
+            obstacles,
+            blocks,
+            stage: vec![0; route.len()],
+            route,
+            lateral,
+            trips: false,
+            pushed: 0,
+            push_max: 0.0,
+        }
+    }
+
+    /// The buildings within reach of `p`: those of the lattice cell it is in and the eight around it.
+    fn buildings_near(&self, p: Vec2) -> impl Iterator<Item = Vec2> + use<> {
+        let (i, j) = ((p.x / PITCH).floor() as i64, (p.y / PITCH).floor() as i64);
+        let k = self.blocks as i64;
+        (i - 1..=i + 1)
+            .flat_map(move |i| (j - 1..=j + 1).map(move |j| (i, j)))
+            .filter(move |(i, j)| (0..k).contains(i) && (0..k).contains(j))
+            .map(|(i, j)| Vec2::new((i as f32 + 0.5) * PITCH, (j as f32 + 0.5) * PITCH))
+    }
+
+    /// How far a walker has to go from `a`'s start to its goal along its route (the straight line for
+    /// the scenes that have no route).
+    fn trip(&self, a: usize) -> f32 {
+        if self.scene.is_city() {
+            self.pos[a].distance(self.route[a]) + self.route[a].distance(self.goal[a])
+        } else {
+            self.pos[a].distance(self.goal[a])
         }
     }
 
@@ -324,12 +485,24 @@ impl World {
             Scene::Open => (self.goal[a] - p).normalize_or_zero() * SPEED,
             Scene::Circle | Scene::Corridor | Scene::Rally => (self.goal[a] - p).clamp_length_max(SPEED),
             // Aim at the gap until through it, then straight on.
-            Scene::Bottleneck => {
+            Scene::Bottleneck | Scene::BottleneckObst => {
                 if p.x < 0.0 {
                     (Vec2::new(0.5, 0.0) - p).normalize_or_zero() * SPEED
                 } else {
                     Vec2::X * SPEED
                 }
+            }
+            Scene::City | Scene::CityPushout => {
+                // A wish that follows the street, as a navigator's would: a carrot a few metres ahead
+                // along the street the walker is on, at the walker's own lateral offset in it. (Aimed
+                // at a waypoint a street away, a walker pushed off its line aims into a building.)
+                let (route, goal, off) = (self.route[a], self.goal[a], self.lateral[a]);
+                let carrot = if self.stage[a] == 0 {
+                    Vec2::new(p.x + (route.x - p.x).clamp(-CARROT, CARROT), route.y + off)
+                } else {
+                    Vec2::new(goal.x + off, p.y + (goal.y - p.y).clamp(-CARROT, CARROT))
+                };
+                (carrot - p).normalize_or_zero() * SPEED
             }
         }
     }
@@ -338,7 +511,12 @@ impl World {
     /// approach is the remaining clearance over `dt`, which cannot be crossed in one step.
     fn walls(&self, p: Vec2, buf: &mut Vec<(Vec2, f32)>) {
         match self.scene {
-            Scene::Open | Scene::Circle | Scene::Rally => {}
+            Scene::Open
+            | Scene::Circle
+            | Scene::Rally
+            | Scene::BottleneckObst
+            | Scene::City
+            | Scene::CityPushout => {}
             Scene::Corridor => {
                 let half = CORRIDOR_WIDTH * 0.5;
                 buf.push((Vec2::Y, (half - p.y - RADIUS).max(0.0) / DT));
@@ -362,9 +540,13 @@ impl World {
         match self.scene {
             Scene::Open | Scene::Circle | Scene::Rally => 0.0,
             Scene::Corridor => (p.y.abs() + RADIUS - CORRIDOR_WIDTH * 0.5).max(0.0),
-            Scene::Bottleneck => {
+            Scene::Bottleneck | Scene::BottleneckObst => {
                 self.segments.iter().map(|s| (RADIUS - s.closest(p).distance(p)).max(0.0)).fold(0.0, f32::max)
             }
+            Scene::City | Scene::CityPushout => self
+                .buildings_near(p)
+                .map(|c| (RADIUS - box_distance(p, c, Vec2::splat(BLOCK * 0.5))).max(0.0))
+                .fold(0.0, f32::max),
         }
     }
 
@@ -374,6 +556,19 @@ impl World {
             if let Some(v) = v {
                 self.vel[a] = *v;
                 self.pos[a] += *v * DT;
+                if self.scene == Scene::CityPushout {
+                    // The host's own contact resolution: a walker whose disc ends the step in a
+                    // building is put back on its surface, and the solve is none the wiser.
+                    let before = self.pos[a];
+                    let after = self
+                        .buildings_near(before)
+                        .fold(before, |p, c| push_out_of_box(p, c, Vec2::splat(BLOCK * 0.5)));
+                    if after != before {
+                        self.pushed += 1;
+                        self.push_max = self.push_max.max(before.distance(after));
+                        self.pos[a] = after;
+                    }
+                }
             }
         }
         for &a in slots {
@@ -389,9 +584,39 @@ impl World {
                 }
                 Scene::Circle => self.gone[a] |= p.distance(self.goal[a]) < ARRIVE,
                 Scene::Corridor => self.gone[a] |= p.x.abs() > self.extent * 0.5 + 0.5,
-                Scene::Bottleneck => self.gone[a] |= p.x > 3.0,
+                Scene::Bottleneck | Scene::BottleneckObst => self.gone[a] |= p.x > 3.0,
                 // Nobody leaves a rally: the press on its centre is the scene.
                 Scene::Rally => {}
+                Scene::City | Scene::CityPushout => {
+                    let (route, goal) = (self.route[a], self.goal[a]);
+                    // Reached the column of the goal, or the goal itself.
+                    let reached = if self.stage[a] == 0 {
+                        (p.x - route.x).abs() < 1.0
+                    } else {
+                        (p.y - goal.y).abs() < 1.0 && (p.x - goal.x).abs() < 2.0
+                    };
+                    if reached {
+                        if self.stage[a] == 0 {
+                            self.stage[a] = 1;
+                        } else if self.trips {
+                            self.gone[a] = true;
+                        } else {
+                            // The next trip starts at the crossing just reached: along its street to
+                            // the new goal's column, then along the column.
+                            self.legs[a] += 1;
+                            let leg = self.legs[a] * 2 + 200;
+                            let streets = (self.blocks + 1) as f32;
+                            let goal = Vec2::new(
+                                (unit(self.keys[a], leg) * streets).floor().min(self.blocks as f32) * PITCH,
+                                (unit(self.keys[a], leg + 1) * streets).floor().min(self.blocks as f32)
+                                    * PITCH,
+                            );
+                            self.route[a] = Vec2::new(goal.x, self.goal[a].y);
+                            self.goal[a] = goal;
+                            self.stage[a] = 0;
+                        }
+                    }
+                }
             }
             if !self.gone[a] {
                 if self.vel[a].length() < 0.05 * SPEED {
@@ -566,6 +791,13 @@ fn solve_parallel(
                     w.walls.clear();
                     world.walls(m.pos, &mut w.walls);
                     let me = Agent { pos: m.pos, vel: m.vel, radius: m.radius, avoids: true };
+                    world.obstacles.push_walls(
+                        &mut w.scratch,
+                        &me,
+                        m.max_speed,
+                        params.obstacle_horizon,
+                        &mut w.walls,
+                    );
                     *slot = Some(new_velocity_in(
                         &mut w.scratch,
                         &me,
@@ -609,12 +841,15 @@ struct Outcome {
     wall_max: f32,
     speed_max: f64,
     allocs: usize,
+    /// The push-out city: agent-steps that ended inside a building, and the deepest of them.
+    pushed: u64,
+    push_max: f32,
 }
 
 /// 20 warm-up and 480 timed steps of one scene. `threads == 0` is `Crowd::solve`; otherwise the
 /// caller's parallel ring on that many workers. `measure` adds the overlap and wall checks.
 fn run(scene: Scene, n: usize, threads: usize, reversed: bool, measure: bool) -> Outcome {
-    let params = CrowdParams::new(scene.range());
+    let params = params_for(scene);
     let mut world = World::new(scene, n);
     let mut crowd = Crowd::default();
     let mut members = Vec::new();
@@ -638,16 +873,30 @@ fn run(scene: Scene, n: usize, threads: usize, reversed: bool, measure: bool) ->
             cand.resize(members.len(), 0usize);
             let before = allocs();
             let start = Instant::now();
-            let solved = crowd.solve(
-                &members,
-                &params,
-                DT,
-                |i, _| {
-                    cand[i] += 1;
-                    true
-                },
-                |i, buf| world.walls(members[i].pos, buf),
-            );
+            let solved = if world.obstacles.is_empty() {
+                crowd.solve(
+                    &members,
+                    &params,
+                    DT,
+                    |i, _| {
+                        cand[i] += 1;
+                        true
+                    },
+                    |i, buf| world.walls(members[i].pos, buf),
+                )
+            } else {
+                crowd.solve_around(
+                    &world.obstacles,
+                    &members,
+                    &params,
+                    DT,
+                    |i, _| {
+                        cand[i] += 1;
+                        true
+                    },
+                    |i, buf| world.walls(members[i].pos, buf),
+                )
+            };
             let elapsed = start.elapsed();
             let made = allocs() - before;
             out.clear();
@@ -701,6 +950,8 @@ fn run(scene: Scene, n: usize, threads: usize, reversed: bool, measure: bool) ->
         wall_max,
         speed_max,
         allocs: alloc_total,
+        pushed: world.pushed,
+        push_max: world.push_max,
     }
 }
 
@@ -723,6 +974,9 @@ fn line(scene: Scene, n: usize, threads: usize, reversed: bool, o: &Outcome, mea
             o.overlap_max, o.wall_max, o.speed_max, o.allocs
         );
     }
+    if measured && scene == Scene::CityPushout {
+        s += &format!(" pushed={} push_max={:.4}", o.pushed, o.push_max);
+    }
     println!("{s}");
 }
 
@@ -732,9 +986,10 @@ fn line(scene: Scene, n: usize, threads: usize, reversed: bool, o: &Outcome, mea
 /// through fast both read `arrived=1.000` otherwise, and in the bottleneck `arrived` is the flow
 /// through the gap within the budget.
 fn arrive(scene: Scene, n: usize, metres_per_agent: f32) {
-    let params = CrowdParams::new(RANGE);
+    let params = params_for(scene);
     let mut world = World::with_ring(scene, n, metres_per_agent);
-    let longest = (0..n).map(|a| world.pos[a].distance(world.goal[a])).fold(0.0, f32::max);
+    world.trips = true;
+    let longest = (0..n).map(|a| world.trip(a)).fold(0.0, f32::max);
     let steps = (3.0 * longest / SPEED / DT).ceil() as usize;
     let mut crowd = Crowd::default();
     let (mut members, mut slots, mut out) = (Vec::new(), Vec::new(), Vec::new());
@@ -747,8 +1002,18 @@ fn arrive(scene: Scene, n: usize, metres_per_agent: f32) {
         if members.is_empty() {
             break;
         }
-        let solved =
-            crowd.solve(&members, &params, DT, |_, _| true, |i, buf| world.walls(members[i].pos, buf));
+        let solved = if world.obstacles.is_empty() {
+            crowd.solve(&members, &params, DT, |_, _| true, |i, buf| world.walls(members[i].pos, buf))
+        } else {
+            crowd.solve_around(
+                &world.obstacles,
+                &members,
+                &params,
+                DT,
+                |_, _| true,
+                |i, buf| world.walls(members[i].pos, buf),
+            )
+        };
         out.clear();
         out.extend_from_slice(solved);
         speed_max = speed_max.max(speed_ratio(&members, &out));
@@ -776,9 +1041,14 @@ fn arrive(scene: Scene, n: usize, metres_per_agent: f32) {
     } else {
         String::new()
     };
+    let pushed = if scene == Scene::CityPushout {
+        format!(" pushed={} push_max={:.4}", world.pushed, world.push_max)
+    } else {
+        String::new()
+    };
     println!(
         "orca: arrive {} agents={n} steps={steps} arrived={:.3} stalled={stalled} overlap_max={:.4} wall_max={:.4} \
-         speed_max={speed_max:.6} hash={:016x} t50_s={t50} t90_s={t90}{ring}",
+         speed_max={speed_max:.6} hash={:016x} t50_s={t50} t90_s={t90}{ring}{pushed}",
         scene.name(),
         arrived as f64 / n as f64,
         overlap_max,
@@ -846,6 +1116,18 @@ fn main() {
         if wanted(Scene::Bottleneck) {
             for n in [100, 200, 400] {
                 arrive(Scene::Bottleneck, n, 1.0);
+            }
+        }
+        if wanted(Scene::BottleneckObst) {
+            for n in [100, 200, 400] {
+                arrive(Scene::BottleneckObst, n, 1.0);
+            }
+        }
+        for scene in [Scene::City, Scene::CityPushout] {
+            if wanted(scene) {
+                for n in [100, 1_000] {
+                    arrive(scene, n, 1.0);
+                }
             }
         }
     }

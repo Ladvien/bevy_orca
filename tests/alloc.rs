@@ -241,3 +241,65 @@ fn a_warmed_dense_crowd_allocates_nothing() {
     }
     assert_eq!(allocs(), 0, "5 warmed solves of a dense crowd allocated {} time(s)", allocs());
 }
+
+/// And for a crowd among obstacles: the edge candidates, the grid query and the lines it casts all
+/// live in buffers that stop growing. A crowd walking a street grid of 36 buildings for 20 ticks,
+/// every one of them moving to new ground, allocates nothing once warm.
+#[test]
+fn a_warmed_crowd_among_obstacles_allocates_nothing() {
+    use bevy_orca::{Crowd, CrowdMember, CrowdParams, ObstaclesBuilder};
+
+    let mut builder = ObstaclesBuilder::new();
+    for i in 0..6 {
+        for j in 0..6 {
+            builder
+                .add_box(Vec2::new(i as f32 * 12.0 + 6.0, j as f32 * 12.0 + 6.0), Vec2::splat(4.0))
+                .expect("a building");
+        }
+    }
+    builder
+        .add_enclosure(&[
+            Vec2::new(-5.0, -5.0),
+            Vec2::new(80.0, -5.0),
+            Vec2::new(80.0, 80.0),
+            Vec2::new(-5.0, 80.0),
+        ])
+        .expect("the map's edge");
+    let obstacles = builder.build().expect("valid");
+
+    let params = CrowdParams::new(3.0);
+    let dt = 1.0 / 30.0;
+    let mut members: Vec<CrowdMember> = (0..300u32)
+        .map(|i| CrowdMember {
+            key: u64::from(i),
+            // Along the horizontal streets, y = 0 mod 12, so nobody starts inside a building.
+            pos: Vec2::new((i % 60) as f32 * 1.2 + 0.3, (i / 60) as f32 * 12.0 * 0.6 % 72.0),
+            vel: Vec2::ZERO,
+            radius: 0.3,
+            max_speed: 1.5,
+            pref_vel: Some(Vec2::new(1.0, 0.0)),
+        })
+        .collect();
+    let mut crowd = Crowd::default();
+    let mut walls_extra = |_: usize, buf: &mut Vec<(Vec2, f32)>| buf.clear();
+    let start = members.clone();
+    let mut run = |members: &mut Vec<CrowdMember>, crowd: &mut Crowd| {
+        for _ in 0..22 {
+            let solved = crowd.solve_around(&obstacles, members, &params, dt, |_, _| true, &mut walls_extra);
+            assert!(solved.iter().flatten().all(|v| v.is_finite()));
+            for (m, s) in members.iter_mut().zip(solved) {
+                m.vel = s.unwrap_or(Vec2::ZERO);
+                m.pos += m.vel * dt;
+            }
+        }
+    };
+    // Warm: a buffer grows to the widest call it has seen (the most edges in range of one member),
+    // and a crowd on the move meets new maxima, so the whole walk is made once.
+    run(&mut members, &mut crowd);
+
+    // The same walk again, from the same start: nothing is wider than before, so nothing grows.
+    members = start;
+    reset_counter();
+    run(&mut members, &mut crowd);
+    assert_eq!(allocs(), 0, "a warmed walk among obstacles allocated {} time(s)", allocs());
+}
