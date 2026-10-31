@@ -214,8 +214,10 @@ impl ObstaclesBuilder {
     /// share an edge, and a hole (an enclosure) per pocket of open floor inside one, with every
     /// straight run of cells a single edge. A block of cells is the four edges
     /// [`add_box`](Self::add_box) gives it (and a walker beside it is handed the same lines): a
-    /// 360 × 360 map of 900 buildings, each an 8 × 8 square of cells, is 3 600 edges built in about 4 ms,
-    /// where one `add_box` per cell is 230 400, four for every cell however deep in a building.
+    /// 360 × 360 map of 900 buildings, each an 8 × 8 square of cells, is 3 600 edges built in 1 to 4 ms,
+    /// where one `add_box` per cell is 230 400, four for every cell however deep in a building. The
+    /// work is `O(cells)` every call (a 1 000 × 1 000 map is about 20 ms, a 2 000 × 2 000 one 75 ms),
+    /// so rebuild when the map changes, not every frame.
     /// Two solid cells that meet only at a corner are two polygons that touch there, never one polygon
     /// that crosses itself, even when the region is joined elsewhere and the corner pinches off a pocket
     /// of floor: no disc passes through a point, so the gap between them is shut.
