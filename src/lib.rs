@@ -389,7 +389,14 @@ pub fn new_velocity_in(
         // Reciprocity: split the change with neighbors that also avoid, by right of way (evenly when
         // the two priorities are equal); take it all against ones that don't (idle units holding
         // ground), whatever their priority.
-        let responsibility = if other.avoids { share(agent.priority, other.priority) } else { 1.0 };
+        let contact = !(dist_sq > combined_radius_sq);
+        let responsibility = if !other.avoids {
+            1.0
+        } else if contact {
+            0.5
+        } else {
+            share(agent.priority, other.priority)
+        };
         let point = agent.vel + responsibility * u;
         // Stored at its point nearest the origin, so a constraint built from a fast own velocity does
         // not carry that speed into the disc test. Finite input can still overflow `f32` (two agents
