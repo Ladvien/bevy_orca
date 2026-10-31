@@ -38,7 +38,7 @@ and the only state test around it is whether the agent being solved is `DT_CROWD
 
 ## Model adopted
 
-`avoids` for a neighbour is true exactly when **this `solve` will steer that member to a velocity of its own choosing**. One function states it, and the member loop and the neighbour builder both use it, so the skip and the flag cannot drift apart:
+`avoids` for a neighbour is true exactly when **this `solve` will steer that member to a velocity of its own choosing**. `wish(m)` is the member loop's skip; `steers(m) = usable_speed(m.max_speed) && wish(m).is_some()` is the flag. Both are one definition, and `steers` runs once per member in the grid pass (a `Vec<bool>` the neighbour builder reads), not once per neighbour offered — the per-neighbour version measured +2 to +5% on sparse and open scenes in a paired same-process A/B, the per-member one +0.0 to +1.6% against an A/A floor of ±2%:
 
 | Member | `solve`'s output for it | Offered to others as |
 |---|---|---|
@@ -79,3 +79,11 @@ A host roots a villager by setting `max_speed: 0.0` (a stun, a placed building, 
 - van den Berg et al., "Reciprocal n-body Collision Avoidance" — the authors' PDF is read and quoted above, but there is still no open-access copy for `paper_download` (see `corpus.md`). Not indexed.
 - RVO2 `Agent.cc` and Recast/Detour `DetourCrowd.cpp`: read on GitHub, not home-still documents.
 - `distill_search` and `abstract_search` were down this pass (`Embedding error: gpu busy: 4866 MB free < 5000 MB required to load bge-m3`); the sources above were read with `markdown_read` by stem and from the authors' PDF.
+
+## Results (iteration 4)
+
+- **Test.** `a_member_that_will_not_move_is_avoided_in_full` (seven non-moving members, one control) fails on `main` at the first case (`[0.7529, -0.2262]` against `[0.5307, -0.4747]`) and passes after.
+- **Differential.** 60 000 random crowds of 2–9 members with one member made hostile (NaN wish, infinite wish, `max_speed` 0, −1, NaN, 1e20): every other member's velocity must equal its velocity in the same crowd with that member `pref_vel: None`. Before: 29 212 crowds differ (4 783–4 969 of 9 859–10 105 per kind). After: 0. The hostile member's own answer is `None` for a bad wish and `Some(Vec2::ZERO)` for a bad speed in all 60 000, before and after.
+- **Predicate.** `usable_speed` against the old guard `max_speed <= 0.0 || !(max_speed * max_speed).is_finite()` on all 2³² `f32` bit patterns: 0 disagree; 1 602 224 127 are usable.
+- **Bit-identical sane solves.** 80 bench rows (5 scenes × 4 sizes × fwd/rev/2 threads/14 threads): base hash = new hash in every row; 0 of 20 (scene, size) groups hold more than one hash across order, thread count and run; the four `arrive` lines match, hashes included.
+- **Cost.** Four crate copies in one process (two of the base, two of the new), solving one frozen crowd in rotating order, thread CPU time, 1 500 repetitions, run twice: new/base paired median −0.57% … +1.62% over sparse 1k, open 1k, open 5k, dense 1k and rally 1k; the A/A pair of base copies disagrees by up to ±2.5%, so +1.6% is not distinguishable from layout. The full bench at 1 000 and 10 000 agents cannot resolve 5% on this host (the same base binary read 1 983 and 6 620 µs for open 1k in different rounds, load 4–14 on 14 cores); its numbers are in the log as noise.
