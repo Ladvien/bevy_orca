@@ -30,8 +30,9 @@ pub struct CrowdMember {
     pub vel: Vec2,
     /// Body radius.
     pub radius: f32,
-    /// Speed ceiling for the solved velocity. A ceiling that is not finite, not positive, or so
-    /// large that its square overflows `f32` leaves the member no velocity to take: it is solved to
+    /// Speed ceiling for the solved velocity. A ceiling that is not finite, not positive, so large
+    /// that its square overflows `f32` (above about `1.8e19`), or so small that its square is not a
+    /// normal number (below about `1.1e-19`) leaves the member no velocity to take: it is solved to
     /// [`Vec2::ZERO`], and its neighbours take the full avoidance against it.
     pub max_speed: f32,
     /// Where this member wants to go.
@@ -610,8 +611,10 @@ mod tests {
             wish_and_speed(-1.0),
             wish_and_speed(f32::NAN),
             wish_and_speed(f32::INFINITY),
-            // So large that its square overflows: `new_velocity_in` answers `Vec2::ZERO` for it too.
+            // So large that its square overflows, or so small that it is not a normal number:
+            // `new_velocity_in` answers `Vec2::ZERO` for them too.
             wish_and_speed(1.0e20),
+            wish_and_speed(1.0e-30),
         ] {
             let got = solve_mover(still);
             assert_eq!(
@@ -913,6 +916,51 @@ mod tests {
             for (i, v) in solved.iter().enumerate() {
                 if let Some(v) = v {
                     assert!(v.is_finite(), "step {step}: member {i} {:?} solved to {v}", members[i]);
+                }
+            }
+        }
+    }
+
+    /// A packed knot is the over-constrained step where the linear program relaxes its constraints,
+    /// and a member must still never leave it faster than its own `max_speed`: on `0.2.1`, 0.8% of
+    /// the velocities `solve` returned for random packs of 2 to 40 members were over that limit, by
+    /// up to 77 times. Packs here are 2 to 40 members in a 2 to 6 m square, each walking in a random
+    /// direction at its own speed, stepped 30 times at 20 Hz.
+    #[test]
+    fn a_packed_crowd_never_leaves_faster_than_its_speed_limit() {
+        let mut state = 7u64;
+        let mut next = || {
+            state = state.wrapping_add(1);
+            (splitmix64(state) >> 40) as f32 / (1u64 << 24) as f32
+        };
+        let mut crowd = Crowd::default();
+        let params = CrowdParams::new(3.0);
+        for pack in 0..60 {
+            let count = 2 + (39.0 * next()) as usize;
+            let side = 2.0 + 4.0 * next();
+            let mut members: Vec<CrowdMember> = (0..count)
+                .map(|key| CrowdMember {
+                    key: key as u64,
+                    pos: Vec2::new(side * next(), side * next()),
+                    vel: Vec2::ZERO,
+                    radius: 0.25 + 0.15 * next(),
+                    max_speed: 1.0 + 0.5 * next(),
+                    pref_vel: Some(Vec2::from_angle(std::f32::consts::TAU * next()) * (0.8 + 0.7 * next())),
+                })
+                .collect();
+            for step in 0..30 {
+                let solved = crowd.solve(&members, &params, 0.05, |_, _| true, |_, _| {}).to_vec();
+                for (i, (m, v)) in members.iter_mut().zip(solved).enumerate() {
+                    let v = v.expect("every member has a wish");
+                    let speed = f64::from(v.x).hypot(f64::from(v.y));
+                    assert!(
+                        speed <= f64::from(m.max_speed) * (1.0 + 1.0e-6),
+                        "pack {pack} step {step} member {i}: speed {speed} is {}× max_speed {}",
+                        speed / f64::from(m.max_speed),
+                        m.max_speed,
+                    );
+                    m.vel = v;
+                    m.pos += v * 0.05;
                 }
             }
         }
