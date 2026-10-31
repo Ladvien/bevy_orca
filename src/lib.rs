@@ -66,7 +66,9 @@ pub struct Agent {
     /// `0` against anything above it takes all of it, and `∞` against anything finite takes none.
     /// A NaN or negative priority counts as `0`: the member gives way and never pushes harder.
     /// A neighbour with `avoids: false` is avoided in full whatever its priority, and walls always
-    /// are. `1.0` is the default and, for a crowd that never changes it, plain ORCA.
+    /// are. Discs that already overlap split the push apart evenly whatever their priorities: right of
+    /// way is a claim on the way to avoid a collision, and touching discs have none to give. `1.0` is
+    /// the default and, for a crowd that never changes it, plain ORCA.
     pub priority: f32,
 }
 
@@ -388,8 +390,19 @@ pub fn new_velocity_in(
 
         // Reciprocity: split the change with neighbors that also avoid, by right of way (evenly when
         // the two priorities are equal); take it all against ones that don't (idle units holding
-        // ground), whatever their priority.
-        let responsibility = if other.avoids { share(agent.priority, other.priority) } else { 1.0 };
+        // ground), whatever their priority. Right of way is a claim on the way to avoid a collision
+        // that has not happened; discs that already overlap have no way to give, so both push apart
+        // evenly. The shares still add to 1, which is all the guarantee asks, and a crowd that
+        // crushes (a high priority on one member of a touching pair left the other to do all the
+        // separating) no longer overlaps more for it.
+        let contact = !(dist_sq > combined_radius_sq);
+        let responsibility = if !other.avoids {
+            1.0
+        } else if contact {
+            0.5
+        } else {
+            share(agent.priority, other.priority)
+        };
         let point = agent.vel + responsibility * u;
         // Stored at its point nearest the origin, so a constraint built from a fast own velocity does
         // not carry that speed into the disc test. Finite input can still overflow `f32` (two agents

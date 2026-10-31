@@ -214,12 +214,14 @@ fn an_unusable_priority_counts_as_zero() {
 }
 
 /// A neighbour whose priority outranks everything (`∞`), or an agent whose own is `0`, takes the same
-/// avoidance as one against a neighbour that holds ground (`avoids: false`): the full dodge.
+/// avoidance as one against a neighbour that holds ground (`avoids: false`): the full dodge. (Of a
+/// neighbour that is not touching: touching discs push apart evenly, see below.)
 #[test]
 fn zero_against_one_is_the_full_avoidance_a_neighbour_holding_ground_gets() {
     let mut rng = Rng(37);
     for case in 0..2_000 {
-        let (me, pref, neighbours, walls) = scene(&mut rng);
+        let (me, pref, mut neighbours, walls) = scene(&mut rng);
+        neighbours.retain(|n| n.pos.distance(me.pos) > me.radius + n.radius);
         // Every neighbour steps aside in the first form and holds ground in the second.
         let held: Vec<Agent> = neighbours.iter().map(|n| Agent { avoids: false, ..*n }).collect();
         let want = solve(&me, pref, &held, &walls);
@@ -475,4 +477,53 @@ fn a_stall_holder_with_priority_is_walked_around_by_a_stream() {
         "at priority 8 he is pushed {eight} m against {equal} m: a ninth of each dodge against a half"
     );
     assert!(table[5].1.0 < 1e-3, "at infinity he takes none of any dodge: {} m", table[5].1.0);
+}
+
+/// Right of way is a claim on the way to avoid a collision that has not happened. Discs that already
+/// overlap have no way to give, so both push apart evenly whatever their priorities: each member's
+/// answer is the one it gets at equal priorities, to the bit, for random overlapping pairs with random
+/// priorities (zero, infinite and NaN included). Without this a high priority left the other member of
+/// a touching pair to do all the separating, and the 100-agent circle swap's deepest overlap went from
+/// 0.040 of a radius to 0.209 at a ratio of 8.
+#[test]
+fn overlapping_discs_push_apart_evenly_whatever_their_priorities() {
+    let mut rng = Rng(71);
+    let mut moved = 0;
+    for case in 0..5_000 {
+        let radius_a = rng.range(0.2, 0.6);
+        let radius_b = rng.range(0.2, 0.6);
+        let pos_a = rng.vec(-2.0, 2.0);
+        let pos_b = pos_a
+            + Vec2::from_angle(rng.range(0.0, std::f32::consts::TAU))
+                * rng.range(0.02, 0.98)
+                * (radius_a + radius_b);
+        let (vel_a, vel_b) = (rng.vec(-1.5, 1.5), rng.vec(-1.5, 1.5));
+        let (pref_a, pref_b) = (rng.vec(-1.5, 1.5), rng.vec(-1.5, 1.5));
+        let solve_pair = |priority_a: f32, priority_b: f32| {
+            let a = Agent { pos: pos_a, vel: vel_a, radius: radius_a, avoids: true, priority: priority_a };
+            let b = Agent { pos: pos_b, vel: vel_b, radius: radius_b, avoids: true, priority: priority_b };
+            (
+                new_velocity(&a, pref_a, &[b], &[], HORIZON, DT, 100.0),
+                new_velocity(&b, pref_b, &[a], &[], HORIZON, DT, 100.0),
+            )
+        };
+        let (equal_a, equal_b) = solve_pair(1.0, 1.0);
+        let (priority_a, priority_b) =
+            (rng.priority(), if case % 7 == 0 { f32::NAN } else { rng.priority() });
+        let (unequal_a, unequal_b) = solve_pair(priority_a, priority_b);
+        assert_eq!(
+            bits(unequal_a),
+            bits(equal_a),
+            "case {case}: priorities {priority_a}, {priority_b}, member a"
+        );
+        assert_eq!(
+            bits(unequal_b),
+            bits(equal_b),
+            "case {case}: priorities {priority_a}, {priority_b}, member b"
+        );
+        if (equal_a - pref_a).length() > 1e-3 {
+            moved += 1;
+        }
+    }
+    assert!(moved > 4_000, "the overlapping pairs must be pushed apart, or this proves nothing: {moved}");
 }
