@@ -2,6 +2,9 @@
 
 Every stem below is a home-still document (`distill_search` / `hs distill search` finds it; `markdown_read` reads it). A source the corpus lacks is listed under **Not in the corpus** with what was tried, so the next pass does not search for it again.
 
+Scanned last: iteration 10 (2026-10-31). `catalog_recent` (200 rows, 02:06–09:07 UTC; the rows past 08:44 are new since iteration 9) held nothing in these domains: couples-therapy, forgiveness and childhood-adversity/chronic-pain papers (the 09:07 batch), a forest-ecology paper and a plume paper (`10.5194_npg-21-269-2014`), the same two MCP/LLM-tooling papers, `The Computational Beauty of Nature` (EmbedSkip again), `transvoxel_*` and the SIGGRAPH 2024/2026 and "Advances in Real-Time Rendering" notes. No title matches ORCA, velocity obstacles, crowds, pedestrian dynamics, low-dimensional LP, spatial hashing or parallel stepping. `system_status`: distill up (CUDA bge-m3, idle), both scribe instances healthy (4 and 5 converting, 788 queued), 18 073 documents embedded. The parallel-solve item (`docs/research/parallel-solve.md`) found its model, technical and engine sources already indexed (below); `distill_search` ranks poorly for a parallel-computing question (psychology and rendering chunks came first), so the passages were pulled with narrower queries by stem. The LAN document links are not reachable from this host and the remote `cloud.lolzlab.com` link answered 504, so `distill_search` chunk text and the authors' ORCA PDF (`read`) were the readable routes.
+
+The scan before it, iteration 9's, as written then (its "Scanned last" is superseded by this one):
 Scanned last: iteration 9 (2026-10-31). `catalog_recent` (200 rows, 02:06-08:44 UTC; the rows past 06:10 are new since iteration 8) held nothing in these domains: psychology and pain-medicine papers, two candle-flame papers, a forest-ecology paper, two MCP/LLM-tooling papers (`10.48550_arxiv.2610.14334`, `10.48550_arxiv.2606.30317`), `The Computational Beauty of Nature` (an EmbedSkip on a Qdrant timeout), and the SIGGRAPH 2024/2026 and "Advances in Real-Time Rendering" notes again. No title matches ORCA, velocity obstacles, crowds, pedestrian dynamics, low-dimensional LP, spatial hashing, parallel stepping or grid outlines. `distill_search` is up (CUDA bge-m3, idle) and both scribe instances are healthy (2 and 5 converting, 803 queued). The solid-cells item (`docs/research/solid-cells.md`) found its technical sources by `distill_search` (listed under "Solid cells to outlines" below) and read Recast's `RecastContour.cpp` on GitHub.
 
 The scan before it, iteration 8's, as written then (its "Scanned last" is superseded by this one):
@@ -82,6 +85,17 @@ Found in iteration 9 by `distill_search` for the solid-cells item; each is a hom
 - `10.1080_2151237x.2011.563682` — Lengyel, "Transition Cells for Dynamic Multiresolution Marching Cubes", Journal of Graphics, GPU, and Game Tools 15(2), 2010 (Terathon, a shipped engine's voxel terrain): ambiguous faces, "the simplest solution, which is enforcing a fixed-edge polarity on ambiguous faces". `transvoxel_dissertation_lengyel2010` (his dissertation) has the same case in Fig. 3.2 and cites Nielson & Hamann 1991.
 - `10.1007_bf01900699` — Natarajan, "On generating topologically consistent isosurfaces from uniform samples", The Visual Computer (HP Labs report HPL-91-76, 1991): §3 states the 2-D case, "for case III, there are two possible topologies" (two diagonal corners inside), which is the checkerboard of two diagonal solid cells.
 - Recast `Recast/Source/RecastContour.cpp` (`recastnavigation/recastnavigation`, `main`; GitHub, read 2026-10-31): `walkContour`, the boundary walk over a cell grid with one fixed turning rule (`dir = (dir+1) & 0x3; // Rotate CW` at a border, `dir = (dir+3) & 0x3; // Rotate CCW` on a step), visited edges cleared (`flags[i] &= ~(1 << dir)`), then `simplifyContour` for the collinear vertices.
+
+## Parallel stepping (technical)
+
+Found in iteration 10 for the parallel-solve item; each is a home-still document unless marked otherwise.
+
+- `10.1109_icra.2011.5980408` (listed above under ORCA) p. 6: "The implementation was parallelized using OpenMP to exploit the independence of the computations for each robot, and take advantage of the multiple cores available on our testbed system."
+- `10.48550_arxiv.2512.04320` — Yan et al., "VLCs: Managing Parallelism with Virtualized Libraries", 2025: libraries that set threads globally "do not allow allocation of specific threads to a call" (the argument against a library that spawns its own).
+- `10.48550_arXiv.1312.3300` — Revol & Théveny, "Numerical Reproducibility and Parallel Computations: Issues for Interval Algorithms", 2013: a reduction's order is what a thread count changes.
+- `Game Engine Architecture, Third Edition, 3rd Edition -- Jason Gregory …` §8.6: data parallelism, one thread per subsystem, and the job system.
+- Recast `DetourCrowd/Include/DetourCrowd.h` and `Source/DetourCrowd.cpp` (`recastnavigation/recastnavigation`, `main`; GitHub, read 2026-10-31): `dtCrowd::update` is one serial call whose velocity-planning loop reuses a single `m_obstacleQuery`.
+- Bevy `bevy_tasks-0.20.0/src/task_pool.rs` (vendored; not a home-still document): `TaskPool::scope` and `Scope::spawn` (`Fut: Future + 'scope + Send`).
 
 ## Not in the corpus
 

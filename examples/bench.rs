@@ -39,8 +39,9 @@
 //!   candidates the search finds and sorts, against at most `max_neighbours` (10) used.
 //! - `hash` — every agent's position and velocity bits after all 500 steps, in key order. The
 //!   `order=rev` line solves the member slice reversed; the `threads>1` lines solve the same step with
-//!   `new_velocity_in` over member chunks on `std::thread::scope` workers, one `OrcaScratch` each,
-//!   with the neighbour rule `Crowd` uses. All of a case's hashes must be equal.
+//!   `Crowd::begin` and `CrowdStep::solve_range`: the members cut into chunks, dealt to that many
+//!   `std::thread::scope` workers, one `CrowdWorker` each (the grid is built once, serially, first).
+//!   All of a case's hashes must be equal.
 //! - `overlap_max` — the deepest overlap between two agents on any step, as a fraction of the radius.
 //!   `wall_max` — the deepest penetration past a wall, in metres. `speed_max` — the largest solved
 //!   speed on any step as a fraction of its member's `max_speed`: `1.0000` is the bound, and anything
@@ -69,7 +70,8 @@
 //! the timing one; `ORCA_ARRIVE=0` skips the arrival section, `ORCA_ARRIVE=only` runs nothing else;
 //! `ORCA_SEED=n` shifts every member's key by `n` (another crowd of the same scene, for a spread);
 //! `ORCA_SERIAL=1` times only the serial forward run, which is all a timing comparison needs, and
-//! leaves the order and thread-count hashes to a full run; `ORCA_OBST_HORIZON=s` sets
+//! leaves the order and thread-count hashes to a full run; `ORCA_THREADS=2,4,8,14` replaces the thread
+//! counts of the `threads>1` lines (default 2 and the machine's parallelism); `ORCA_OBST_HORIZON=s` sets
 //! `CrowdParams::obstacle_horizon` for the scenes that have obstacles; `ORCA_LANE=f` is the share of
 //! a city street's width its walkers' four lanes spread over (default 0.6, outer lanes 0.8 m from the
 //! brick; 1.0 puts them 0.2 m from it, which squeezes head-on pairs against the wall).
@@ -82,9 +84,7 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use bevy_math::Vec2;
-use bevy_orca::{
-    Agent, Crowd, CrowdMember, CrowdParams, Obstacles, ObstaclesBuilder, OrcaScratch, new_velocity_in,
-};
+use bevy_orca::{Crowd, CrowdMember, CrowdParams, CrowdWorker, Obstacles, ObstaclesBuilder};
 
 const RADIUS: f32 = 0.3;
 const SPEED: f32 = 1.3;
@@ -745,9 +745,7 @@ impl World {
 }
 
 // ---------------------------------------------------------------------------------------------
-// The caller's parallel ring, until the crate offers one: the same neighbour rule `Crowd` applies
-// (members within range, sorted by distance then key, at most `max_neighbours`, kicked toward the
-// right of the wish), solved with `new_velocity_in` on scoped worker threads.
+// The overlap check's own grid, independent of `Crowd`'s so the check does not trust what it checks.
 
 /// A uniform grid of member indices, cell = range.
 #[derive(Default)]
@@ -760,12 +758,6 @@ fn cell_of(pos: Vec2, range: f32) -> Option<(i32, i32)> {
         return None;
     }
     Some(((pos.x / range).floor() as i32, (pos.y / range).floor() as i32))
-}
-
-/// The order `Crowd` keeps candidates in: distance, then key, then index. The index makes it a strict
-/// total order, so an unstable selection and sort give the one result a stable sort would.
-fn nearest_first(a: &(f32, u64, usize), b: &(f32, u64, usize)) -> std::cmp::Ordering {
-    a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2))
 }
 
 impl Grid {
@@ -794,92 +786,58 @@ impl Grid {
     }
 }
 
-#[derive(Default)]
-struct Worker {
-    scratch: OrcaScratch,
-    near: Vec<(f32, u64, usize)>,
-    neighbours: Vec<Agent>,
-    walls: Vec<(Vec2, f32)>,
-    candidates: usize,
-    candidates_max: usize,
-}
-
+/// The step on `workers.len()` threads: `Crowd::begin` builds the grid, then the members are cut into
+/// chunks, four or so to a worker so a dense corner does not pin one thread, and dealt to the workers in
+/// turn; each worker solves its chunks with `CrowdStep::solve_range` into its slice of `out`. `cand`
+/// counts the members `sees` was asked about, per member, as the serial run does. A Bevy host hands the
+/// same chunks to its task pool instead of `std::thread::scope`.
 fn solve_parallel(
+    crowd: &mut Crowd,
     world: &World,
     members: &[CrowdMember],
     params: &CrowdParams,
-    grid: &mut Grid,
-    workers: &mut [Worker],
+    workers: &mut [CrowdWorker],
+    cand: &mut Vec<usize>,
     out: &mut Vec<Option<Vec2>>,
 ) {
-    let range = params.neighbour_range;
-    grid.build(members.iter().map(|m| Some(m.pos)), range);
+    cand.clear();
+    cand.resize(members.len(), 0);
     out.clear();
     out.resize(members.len(), None);
-    let chunk = members.len().div_ceil(workers.len()).max(1);
-    let grid = &*grid;
+    let step = if world.obstacles.is_empty() {
+        crowd.begin(members, params, DT)
+    } else {
+        crowd.begin_around(&world.obstacles, members, params, DT)
+    };
+    let lanes = workers.len().max(1);
+    let chunk = members.len().div_ceil(lanes * 4).max(16);
+    type Chunk<'a> = (usize, &'a mut [Option<Vec2>], &'a mut [usize]);
+    let mut dealt: Vec<Vec<Chunk>> = (0..lanes).map(|_| Vec::new()).collect();
+    for (c, (slice, counts)) in out.chunks_mut(chunk).zip(cand.chunks_mut(chunk)).enumerate() {
+        if let Some(lane) = dealt.get_mut(c % lanes) {
+            lane.push((c * chunk, slice, counts));
+        }
+    }
     std::thread::scope(|scope| {
-        for (c, (slice, w)) in out.chunks_mut(chunk).zip(workers.iter_mut()).enumerate() {
+        for (worker, lane) in workers.iter_mut().zip(dealt) {
             scope.spawn(move || {
-                for (k, slot) in slice.iter_mut().enumerate() {
-                    let i = c * chunk + k;
-                    let m = members[i];
-                    let (Some(pref), true) = (m.pref_vel, m.pos.is_finite()) else {
-                        continue;
-                    };
-                    if !pref.is_finite() {
-                        continue;
-                    }
-                    w.near.clear();
-                    grid.around(m.pos, range, |j| {
-                        if j == i {
-                            return;
-                        }
-                        let other = members[j];
-                        let dist = other.pos.distance(m.pos);
-                        if dist <= range {
-                            w.near.push((dist, other.key, j));
-                        }
-                    });
-                    w.candidates += w.near.len();
-                    w.candidates_max = w.candidates_max.max(w.near.len());
-                    let keep = params.max_neighbours;
-                    if keep < w.near.len() {
-                        w.near.select_nth_unstable_by(keep, nearest_first);
-                        w.near.truncate(keep);
-                    }
-                    w.near.sort_unstable_by(nearest_first);
-                    w.neighbours.clear();
-                    for &(_, _, j) in &w.near {
-                        let other = members[j];
-                        w.neighbours.push(Agent {
-                            pos: other.pos,
-                            vel: other.vel,
-                            radius: other.radius,
-                            avoids: other.pref_vel.is_some(),
-                        });
-                    }
-                    let wish = if w.near.is_empty() { pref } else { pref - pref.perp() * params.nudge };
-                    w.walls.clear();
-                    world.walls(m.pos, &mut w.walls);
-                    let me = Agent { pos: m.pos, vel: m.vel, radius: m.radius, avoids: true };
-                    world.obstacles.push_walls(
-                        &mut w.scratch,
-                        &me,
-                        m.max_speed,
-                        params.obstacle_horizon,
-                        &mut w.walls,
+                for (first, slice, counts) in lane {
+                    step.solve_range(
+                        worker,
+                        first,
+                        slice,
+                        |i, _| {
+                            if let Some(count) = counts.get_mut(i.wrapping_sub(first)) {
+                                *count += 1;
+                            }
+                            true
+                        },
+                        |i, buf| {
+                            if let Some(m) = members.get(i) {
+                                world.walls(m.pos, buf);
+                            }
+                        },
                     );
-                    *slot = Some(new_velocity_in(
-                        &mut w.scratch,
-                        &me,
-                        wish,
-                        &w.neighbours,
-                        &w.walls,
-                        params.time_horizon,
-                        DT,
-                        m.max_speed,
-                    ));
                 }
             });
         }
@@ -930,9 +888,8 @@ fn run(scene: Scene, n: usize, threads: usize, reversed: bool, measure: bool) ->
     let mut members = Vec::new();
     let mut slots = Vec::new();
     let mut cand = Vec::new();
-    let mut grid = Grid::default();
     let mut check_grid = Grid::default();
-    let mut workers: Vec<Worker> = (0..threads).map(|_| Worker::default()).collect();
+    let mut workers: Vec<CrowdWorker> = (0..threads).map(|_| CrowdWorker::default()).collect();
     let mut out = Vec::new();
 
     let mut times = Vec::with_capacity(TIMED);
@@ -984,18 +941,14 @@ fn run(scene: Scene, n: usize, threads: usize, reversed: bool, measure: bool) ->
                 cand_max = cand_max.max(cand.iter().copied().max().unwrap_or(0));
             }
         } else {
-            for w in workers.iter_mut() {
-                w.candidates = 0;
-                w.candidates_max = 0;
-            }
             let start = Instant::now();
-            solve_parallel(&world, &members, &params, &mut grid, &mut workers, &mut out);
+            solve_parallel(&mut crowd, &world, &members, &params, &mut workers, &mut cand, &mut out);
             let elapsed = start.elapsed();
             if timed {
                 times.push(elapsed.as_secs_f64() * 1e6);
                 solved_total += out.iter().flatten().count();
-                cand_total += workers.iter().map(|w| w.candidates).sum::<usize>();
-                cand_max = cand_max.max(workers.iter().map(|w| w.candidates_max).max().unwrap_or(0));
+                cand_total += cand.iter().sum::<usize>();
+                cand_max = cand_max.max(cand.iter().copied().max().unwrap_or(0));
             }
         }
         world.advance(&slots, &out);
@@ -1164,10 +1117,13 @@ fn main() {
                 }
                 let rev = run(scene, n, 0, true, false);
                 line(scene, n, 1, true, &rev, false);
-                let mut thread_counts = vec![2];
-                if threads_default > 2 {
-                    thread_counts.push(threads_default);
-                }
+                let thread_counts: Vec<usize> = match std::env::var("ORCA_THREADS") {
+                    Ok(list) => {
+                        list.split(',').filter_map(|w| w.trim().parse().ok()).filter(|&t| t > 0).collect()
+                    }
+                    Err(_) if threads_default > 2 => vec![2, threads_default],
+                    Err(_) => vec![2],
+                };
                 for t in thread_counts {
                     let par = run(scene, n, t, false, false);
                     line(scene, n, t, false, &par, false);

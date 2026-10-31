@@ -95,6 +95,31 @@ Reciprocity is assumed only of a neighbour this step moves. A member that is `No
 
 `Crowd` allocates nothing after its buffers are warm, wherever the crowd walks and however tightly it packs: its neighbour grid is one entry per member, sorted by cell and rebuilt every solve, so its memory and its cost follow how many members there are and not how much ground they have covered; and of the candidates in range only the nearest `max_neighbours` are kept, found and ordered in place, so a member with hundreds of others in range pays for its ten neighbours rather than for ordering the rest. `CrowdParams::new(range)` gives a 2-second horizon against other members, a 0.5-second one against [obstacles](#static-obstacles), at most 10 neighbours and a 5% nudge to the right; set `nudge` to `0.0` to keep perfectly symmetric input perfectly symmetric, or negative to pass on the left.
 
+### Across threads
+
+A step is one serial part and a lot of per-member work that reads a frozen world and writes only its own answer. [`Crowd::begin`] does the serial part (the neighbour grid: about 3% of a 10 000-walker step) and returns a [`CrowdStep`]; [`CrowdStep::solve_range`] does the rest for any run of members, into any slice of output, with a [`CrowdWorker`] (the per-thread buffers) of its own. The crate starts no thread, takes no lock and reads no thread count — it would put a second set of threads on the cores your engine already schedules — so you cut the ranges and run them where your game runs work, here on Bevy's task pool:
+
+```rust
+use bevy::tasks::ComputeTaskPool;
+
+let step = crowd.begin(&members, &params, dt);               // the serial part: builds the grid
+let chunk = 256;                                              // one worker per chunk: they are only buffers
+workers.resize_with(members.len().div_ceil(chunk), CrowdWorker::default);
+solved.resize(members.len(), None);                           // `Vec<Option<Vec2>>`, kept like the `Crowd`
+let ranges: Vec<_> = solved.chunks_mut(chunk).zip(workers.iter_mut()).enumerate().collect();
+ComputeTaskPool::get().scope(|scope| {
+    for (c, (slice, worker)) in ranges {
+        scope.spawn(async move {
+            step.solve_range(worker, c * chunk, slice, |i, j| sees(i, j), |i, buf| fill_walls(i, buf));
+        });
+    }
+});
+```
+
+`out[k]` is member `first + k`, exactly what `solve` returns for it (`None` for a member that is not solved, and for a slot past the last member). `CrowdStep` is `Copy`, `Send` and `Sync` and a `CrowdWorker` is `Send`, so a task of `bevy_tasks`' `scope` (`Future + 'scope + Send`) can hold both with nothing `'static` (the `sees` and `walls` closures you give it live in the task too, so they must be `Send`); `tests/task_pool.rs` runs this shape on the real pool. `begin_around` is the same with [`Obstacles`](#static-obstacles).
+
+**The split changes no velocity.** No member's answer reads another's and nothing is summed across members, so any partition of the members into ranges, solved in any order on any number of threads, gives every slot the bits `solve` gives (as long as your `sees` and `walls` are functions of the indices they are handed): the thread count is not an input to the simulation, and a replay recorded on four cores plays back on fourteen. Measured on a 14-core laptop that was also running other jobs (a pure compute loop scales to only about 3 of its cores here), a 10 000-walker open field took 28 ms serially and 9.4 ms on a 4-, 8- or 14-thread Bevy pool, 1 000 walkers 2.4 ms and 0.76 ms, with the pool's total CPU time 0.98 to 1.14 times the serial step's: the split costs no more work than it spreads. On a pool a small crowd loses nothing: at 256 members a chunk, a hundred walkers are one task and take what `solve` takes (165 against 167 µs), 300 walkers are 1.4× faster, 1 000 sparse walkers (0.7 ms serially) 2.5× faster. Starting a thread per step instead, as `bench`'s `std::thread::scope` rows do, costs 100–170 µs and loses below about a thousand walkers.
+
 ## Static obstacles
 
 `walls` is for what changes from step to step. Geometry that does not — buildings, a wall with a doorway, the edge of the map — is an [`Obstacles`], built once and handed to [`Crowd::solve_around`]:
@@ -137,7 +162,7 @@ Measured in `bench` (macOS arm64, serial, medians of three interleaved rounds; f
 
 ## Scope
 
-Agent↔agent in `new_velocity_in`; static geometry as hard half-planes: either the `walls` you compute (a door that is shut this step: each a unit vector toward a solid plus the speed at which the agent may still close on it) or the ones [`Obstacles`] derives from polygons you built once. Neither is ever relaxed. The way round a building is not found here: it is your navigator's, and arrives as the preferred velocity. Final contact resolution is yours.
+Agent↔agent in `new_velocity_in`; static geometry as hard half-planes: either the `walls` you compute (a door that is shut this step: each a unit vector toward a solid plus the speed at which the agent may still close on it) or the ones [`Obstacles`] derives from polygons you built once. Neither is ever relaxed. The way round a building is not found here: it is your navigator's, and arrives as the preferred velocity. Final contact resolution is yours. So is where the work runs: the crate starts no thread, and [`Crowd::begin`] hands a step to whichever scheduler you have ([above](#across-threads)).
 
 ## Features
 
@@ -148,7 +173,7 @@ Both are off by default, and neither adds a type to the dependency graph a consu
 
 ## Determinism
 
-Pure arithmetic, no RNG, no interior mutability. Identical inputs give bit-identical outputs, which is why the parent project can hash its simulation state. Allocation happens only while a buffer grows: after the first call, [`new_velocity_in`] and [`Crowd::solve`] allocate nothing, and `tests/alloc.rs` proves it with a counting allocator.
+Pure arithmetic, no RNG, no interior mutability. Identical inputs give bit-identical outputs, which is why the parent project can hash its simulation state. The thread count is not an input: [`Crowd::solve`] and the same step split into any ranges over any number of threads ([`CrowdStep::solve_range`]) give the same bits, and `bench` hashes both at every thread count to prove it. Allocation happens only while a buffer grows: after the first call, [`new_velocity_in`], [`Crowd::solve`] and a warm [`CrowdStep::solve_range`] allocate nothing, and `tests/alloc.rs` proves it with a counting allocator.
 
 `bevy_math` is taken with `default-features = false, features = ["nostd-libm"]`, matching Bevy's own internal selection: the defaults would enable `glam/std` and swap glam's transcendentals from libm to std's, which is a behaviour change for anyone hashing transforms downstream.
 
@@ -164,7 +189,7 @@ cargo run -p bevy_orca --example circle_swap    # the gif above. Needs a GPU.
 
 `head_on`, `wall_corridor` and `street` print to the terminal — no window, no GPU, nothing to install. `head_on` walks two agents into each other and prints the lateral offset each takes, then repeats it with the neighbour holding ground so you can see the mover absorb the whole avoidance. `wall_corridor` adds wall half-planes and reports the deepest penetration, which stays at zero. `street` is the whole of the obstacle API in under 150 lines: four buildings, three streams of walkers crossing and turning the corners of the block, one `Crowd::solve_around` a step, the closest any disc came to a wall (never below zero) and how many arrived.
 
-`bench` is the measuring instrument. It times one `Crowd::solve` step in ten scenes — an open field of walkers, the circle swap, a two-way corridor with walls, a room draining through a gap two agents wide, a rally of units hex-packed around one point with a 5 m neighbour range (about 200 candidates per member at 10 000 agents), that gap again with its wall as `Obstacles`, and a city of buildings with walkers on its streets, once with the buildings as `Obstacles`, once with them handled the way a host does without (nothing in the solve, and a walker whose disc ends a step in a building put back on its surface), and twice more as a grid of solid cells, through `add_cells` and as one `add_box` per cell, which print the obstacle `edges` and the `build_us` the builder took — at 100, 1 000, 5 000 and 10 000 agents, and prints one line per case: median and p99 step time, agents per millisecond, neighbour candidates per agent, the deepest overlap and wall penetration, allocations inside the solve, and a hash of the final state that must be equal whether the members are given forwards, reversed, or solved by a caller's own parallel loop over `new_velocity_in`. `ORCA_SCENES=open,corridor` and `ORCA_SIZES=100,1000` narrow it.
+`bench` is the measuring instrument. It times one `Crowd::solve` step in ten scenes — an open field of walkers, the circle swap, a two-way corridor with walls, a room draining through a gap two agents wide, a rally of units hex-packed around one point with a 5 m neighbour range (about 200 candidates per member at 10 000 agents), that gap again with its wall as `Obstacles`, and a city of buildings with walkers on its streets, once with the buildings as `Obstacles`, once with them handled the way a host does without (nothing in the solve, and a walker whose disc ends a step in a building put back on its surface), and twice more as a grid of solid cells, through `add_cells` and as one `add_box` per cell, which print the obstacle `edges` and the `build_us` the builder took — at 100, 1 000, 5 000 and 10 000 agents, and prints one line per case: median and p99 step time, agents per millisecond, neighbour candidates per agent, the deepest overlap and wall penetration, allocations inside the solve, and a hash of the final state that must be equal whether the members are given forwards, reversed, or split over any number of `std::thread::scope` workers with `Crowd::begin` and `CrowdStep::solve_range`. `ORCA_SCENES=open,corridor`, `ORCA_SIZES=100,1000` and `ORCA_THREADS=2,4,8,14` narrow it.
 
 `bench` also runs an `arrive` section: the circle swap (20 agents on a ring that jams, 20 on a wider one, 100 and 1 000), a two-way corridor, the bottleneck with its wall as half-planes and as `Obstacles`, and the city with and without its buildings in the solve, each for three times the straight-line time, printing the fraction that arrived, how many stalled for over two seconds, and when half and nine tenths had arrived (`t50_s`, `t90_s`). `ORCA_SEED=n` shifts the members' keys for another crowd of the same scene, `ORCA_SERIAL=1` times only the serial forward run, and `ORCA_OBST_HORIZON=s` sets the obstacle horizon.
 
