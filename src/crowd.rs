@@ -418,9 +418,10 @@ impl Crowd {
 impl CrowdStep<'_> {
     /// Solve members `first .. first + out.len()` and write each answer to `out`: `out[k]` is member
     /// `first + k`, exactly what [`Crowd::solve`] returns for it (`None` when it is not solved, see
-    /// there). A slot past the last member is `None`. Calls for disjoint ranges may run at the same
-    /// time, on different threads, each with its own `worker` and its own slice of the output; calls
-    /// for overlapping ranges are harmless and give the same answers twice.
+    /// there). A slot past the last member is `None`, and so is one whose index would overflow
+    /// `usize`; every slot of `out` is overwritten. Calls may run at the same time on different
+    /// threads, each with its own `worker` and its own slice of the output: nothing they read is
+    /// written, and they share nothing they write.
     ///
     /// `sees(i, j)` and `walls(i, &mut buf)` are as in [`Crowd::solve`], and the indices they are
     /// given are indices into the `members` the step was begun with, not into the range. Each call takes
@@ -1095,6 +1096,8 @@ mod tests {
             (splitmix64(state) >> 40) as f32 / (1u64 << 24) as f32
         };
         let mut crowd = Crowd::default();
+        let mut halves = Crowd::default();
+        let mut workers = [CrowdWorker::default(), CrowdWorker::default()];
         for step in 0..3_000u64 {
             let share = if step % 4 == 0 { 0.0 } else { 0.25 };
             let mut value = |lo: f32, hi: f32| {
@@ -1130,24 +1133,28 @@ mod tests {
                 obstacle_horizon: value(0.1, 1.0),
             };
             let dt = value(1.0 / 60.0, 0.1);
-            let solved = crowd.solve(
-                &members,
-                &params,
-                dt,
-                |i, j| (i + j) % 5 != 3,
-                |i, buf| {
-                    if let Some(&wall) = walls.get(i)
-                        && i % 2 == 0
-                    {
-                        buf.push(wall);
-                    }
-                },
-            );
+            let sees = |i: usize, j: usize| (i + j) % 5 != 3;
+            let fill = |i: usize, buf: &mut Vec<(Vec2, f32)>| {
+                if let Some(&wall) = walls.get(i)
+                    && i.is_multiple_of(2)
+                {
+                    buf.push(wall);
+                }
+            };
+            let solved = crowd.solve(&members, &params, dt, sees, fill).to_vec();
             for (i, v) in solved.iter().enumerate() {
                 if let Some(v) = v {
                     assert!(v.is_finite(), "step {step}: member {i} {:?} solved to {v}", members[i]);
                 }
             }
+            // The same step in two ranges on two workers, hostile parameters included: the same bits.
+            let mut split = vec![Some(Vec2::new(9.0, 9.0)); n];
+            let (low, high) = split.split_at_mut(n / 2);
+            let view = halves.begin(&members, &params, dt);
+            let [first_worker, second_worker] = &mut workers;
+            view.solve_range(second_worker, n / 2, high, sees, fill);
+            view.solve_range(first_worker, 0, low, sees, fill);
+            assert_eq!(bits(&split), bits(&solved), "step {step}: two ranges differ from one");
         }
     }
 
