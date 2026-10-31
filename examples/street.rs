@@ -106,6 +106,7 @@ fn main() {
                     radius: RADIUS,
                     max_speed: SPEED,
                     pref_vel: Some(wish),
+                    priority: 1.0,
                 }
             })
             .collect();

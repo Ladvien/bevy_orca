@@ -99,7 +99,15 @@ fn walk(solids: &[Solid], start: Vec2, goal: Vec2, steps: usize) -> (usize, f32,
     let (mut worst, mut arrived) = (0.0f32, steps);
     for step in 0..steps {
         let pref = (goal - pos).clamp_length_max(SPEED);
-        let member = CrowdMember { key: 0, pos, vel, radius: RADIUS, max_speed: SPEED, pref_vel: Some(pref) };
+        let member = CrowdMember {
+            key: 0,
+            pos,
+            vel,
+            radius: RADIUS,
+            max_speed: SPEED,
+            pref_vel: Some(pref),
+            priority: 1.0,
+        };
         vel = crowd.solve_around(&obstacles, &[member], &params, DT, |_, _| true, |_, _| {})[0]
             .expect("solved");
         pos += vel * DT;
@@ -202,6 +210,7 @@ fn a_crowd_pressing_on_a_wall_never_pushes_through() {
                 radius: RADIUS,
                 max_speed: SPEED,
                 pref_vel: Some(v(unit(&mut counter) - 0.5, -SPEED)),
+                priority: 1.0,
             })
             .collect();
         let solved = crowd.solve_around(&obstacles, &members, &params, DT, |_, _| true, |_, _| {});
@@ -251,6 +260,7 @@ fn an_enclosure_keeps_everyone_in() {
                     radius: RADIUS,
                     max_speed: SPEED,
                     pref_vel: Some((goal - pos).clamp_length_max(SPEED)),
+                    priority: 1.0,
                 })
                 .collect();
             let solved = crowd.solve_around(&obstacles, &members, &params, DT, |_, _| true, |_, _| {});
@@ -291,6 +301,7 @@ fn a_gap_two_agents_wide_passes_its_crowd() {
                     radius: RADIUS,
                     max_speed: SPEED,
                     pref_vel: Some((aim - pos).normalize_or_zero() * SPEED),
+                    priority: 1.0,
                 }
             })
             .collect();
@@ -357,6 +368,7 @@ fn a_city_of_boxes_keeps_its_walkers_out_and_moving() {
                     } else {
                         (aim - *pos).clamp_length_max(SPEED)
                     }),
+                    priority: 1.0,
                 }
             })
             .collect();
@@ -391,6 +403,7 @@ fn an_empty_set_changes_no_answer() {
             radius: RADIUS,
             max_speed: SPEED,
             pref_vel: Some(v(unit(&mut counter) - 0.5, unit(&mut counter) - 0.5) * 3.0),
+            priority: 1.0,
         })
         .collect();
     let walls = |i: usize, buf: &mut Vec<(Vec2, f32)>| buf.push((Vec2::Y, i as f32 * 0.01));
@@ -429,6 +442,7 @@ fn the_answer_does_not_depend_on_member_order() {
                     radius: RADIUS,
                     max_speed: SPEED,
                     pref_vel: Some((goals[i] - state[i].0).clamp_length_max(SPEED)),
+                    priority: 1.0,
                 })
                 .collect()
         };
@@ -474,6 +488,7 @@ fn the_callers_own_walls_and_obstacles_both_hold() {
             radius: RADIUS,
             max_speed: SPEED,
             pref_vel: Some(v(1.0, 1.0).normalize() * SPEED),
+            priority: 1.0,
         };
         let door = (Vec2::Y, ((3.6 - pos.y - RADIUS).max(0.0)) / DT);
         vel = crowd.solve_around(&obstacles, &[member], &params, DT, |_, _| true, |_, buf| buf.push(door))[0]
@@ -525,7 +540,7 @@ fn hostile_agents_among_obstacles_give_only_finite_answers() {
         };
         let pos = v(pick(&mut counter), pick(&mut counter));
         let vel = v(pick(&mut counter), pick(&mut counter));
-        let agent = Agent { pos, vel, radius: pick(&mut counter), avoids: true };
+        let agent = Agent { pos, vel, radius: pick(&mut counter), avoids: true, priority: 1.0 };
         let (speed, horizon) = (pick(&mut counter), pick(&mut counter));
         walls.clear();
         obstacles.push_walls(&mut scratch, &agent, speed, horizon, &mut walls);
@@ -555,6 +570,7 @@ fn hostile_agents_among_obstacles_give_only_finite_answers() {
                 radius: pick(&mut counter),
                 max_speed: pick(&mut counter),
                 pref_vel: Some(v(pick(&mut counter), pick(&mut counter))),
+                priority: 1.0,
             })
             .collect();
         let params = CrowdParams { obstacle_horizon: pick(&mut counter), ..CrowdParams::new(3.0) };
@@ -577,7 +593,7 @@ fn an_agent_on_an_edge_or_a_vertex_cannot_approach() {
     for pos in
         [v(1.0, 0.0), v(1.0, 1.0), v(1.0 + 1e-6, 0.3), v(1.2, 0.0), v(1.2, 1.2), v(0.0, 0.0), v(-1.0, -1.0)]
     {
-        let agent = Agent { pos, vel: Vec2::ZERO, radius: RADIUS, avoids: true };
+        let agent = Agent { pos, vel: Vec2::ZERO, radius: RADIUS, avoids: true, priority: 1.0 };
         let mut walls = Vec::new();
         obstacles.push_walls(&mut scratch, &agent, SPEED, 0.5, &mut walls);
         let answer = new_velocity_in(
@@ -593,7 +609,7 @@ fn an_agent_on_an_edge_or_a_vertex_cannot_approach() {
         assert!(answer.is_finite(), "{pos}: {answer:?}");
     }
     // Just outside the right face, wishing to go left into it: it may not.
-    let agent = Agent { pos: v(1.2, 0.0), vel: Vec2::ZERO, radius: RADIUS, avoids: true };
+    let agent = Agent { pos: v(1.2, 0.0), vel: Vec2::ZERO, radius: RADIUS, avoids: true, priority: 1.0 };
     let mut walls = Vec::new();
     obstacles.push_walls(&mut scratch, &agent, SPEED, 0.5, &mut walls);
     let answer = new_velocity_in(&mut scratch, &agent, v(-SPEED, 0.0), &[], &walls, 1.0, DT, SPEED);
@@ -626,7 +642,7 @@ fn an_agent_touching_a_wall_within_rounding_cannot_walk_into_it() {
     let mut scratch = OrcaScratch::default();
     let mut walls = Vec::new();
     let mut step = |pos: Vec2, vel: Vec2, pref: Vec2| -> f32 {
-        let agent = Agent { pos, vel, radius: RADIUS, avoids: true };
+        let agent = Agent { pos, vel, radius: RADIUS, avoids: true, priority: 1.0 };
         walls.clear();
         obstacles.push_walls(&mut scratch, &agent, 1.3, 0.5, &mut walls);
         let answer = new_velocity_in(&mut scratch, &agent, pref, &[], &walls, 1.0, DT, 1.3);
@@ -671,7 +687,7 @@ fn an_agent_creeping_past_a_convex_corner_cannot_step_into_it() {
     let mut walls = Vec::new();
     // One step of an agent at `pos` among `building`: how far its disc ends inside it.
     let mut step = |building: &[Solid; 1], obstacles: &Obstacles, pos: Vec2, vel: Vec2, pref: Vec2| -> f32 {
-        let agent = Agent { pos, vel, radius: RADIUS, avoids: true };
+        let agent = Agent { pos, vel, radius: RADIUS, avoids: true, priority: 1.0 };
         walls.clear();
         obstacles.push_walls(&mut scratch, &agent, SPEED, 0.5, &mut walls);
         let answer = new_velocity_in(&mut scratch, &agent, pref, &[], &walls, 2.0, DT, SPEED);
@@ -770,12 +786,14 @@ fn every_answer_satisfies_every_obstacle_line() {
                 radius: RADIUS,
                 max_speed: SPEED,
                 pref_vel: Some((goal - pos).clamp_length_max(SPEED)),
+                priority: 1.0,
             })
             .collect();
         let solved = crowd.solve_around(&obstacles, &members, &params, DT, |_, _| true, |_, _| {}).to_vec();
         for (member, answer) in members.iter().zip(&solved) {
             let answer = answer.expect("solved");
-            let agent = Agent { pos: member.pos, vel: member.vel, radius: RADIUS, avoids: true };
+            let agent =
+                Agent { pos: member.pos, vel: member.vel, radius: RADIUS, avoids: true, priority: 1.0 };
             let mut walls = Vec::new();
             obstacles.push_walls(&mut scratch, &agent, SPEED, params.obstacle_horizon, &mut walls);
             for &(normal, c) in &walls {
@@ -809,6 +827,7 @@ fn an_obstacle_horizon_shorter_than_the_step_is_raised_to_it() {
         radius: RADIUS,
         max_speed: SPEED,
         pref_vel: Some(v(SPEED, 0.0)),
+        priority: 1.0,
     };
     let dt = 1.0;
     let answer =
@@ -859,6 +878,7 @@ fn a_courtyard_is_an_enclosure_inside_a_solid() {
                 radius: RADIUS,
                 max_speed: SPEED,
                 pref_vel: Some((goal - pos).clamp_length_max(SPEED)),
+                priority: 1.0,
             })
             .collect();
         let solved = crowd.solve_around(&obstacles, &members, &params, DT, |_, _| true, |_, _| {});
@@ -918,7 +938,7 @@ fn a_block_of_cells_gives_the_lines_of_a_box() {
     for _ in 0..4000 {
         let pos = origin + v(unit(&mut counter) * width as f32, unit(&mut counter) * height as f32) * size;
         let vel = v(unit(&mut counter) - 0.5, unit(&mut counter) - 0.5) * 3.0;
-        let agent = Agent { pos, vel, radius: RADIUS, avoids: true };
+        let agent = Agent { pos, vel, radius: RADIUS, avoids: true, priority: 1.0 };
         let (mut a, mut b) = (Vec::new(), Vec::new());
         cells.push_walls(&mut scratch, &agent, SPEED, 0.5, &mut a);
         boxes.push_walls(&mut scratch, &agent, SPEED, 0.5, &mut b);
@@ -1011,6 +1031,7 @@ fn a_crowd_on_a_random_map_never_enters_a_solid_cell() {
                     radius: RADIUS,
                     max_speed: SPEED,
                     pref_vel: Some((goals[i] - pos).clamp_length_max(SPEED)),
+                    priority: 1.0,
                 })
                 .collect();
             let solved = crowd.solve_around(&obstacles, &members, &params, DT, |_, _| true, |_, _| {});
@@ -1054,6 +1075,7 @@ fn a_gap_between_cells_that_touch_at_a_corner_is_shut() {
                 radius: RADIUS,
                 max_speed: SPEED,
                 pref_vel: Some((goal - pos).clamp_length_max(SPEED)),
+                priority: 1.0,
             };
             vel = crowd.solve_around(&obstacles, &[member], &params, DT, |_, _| true, |_, _| {})[0]
                 .expect("solved");

@@ -32,8 +32,10 @@ fn corridor_walls(pos: Vec2) -> Vec<(Vec2, f32)> {
 }
 
 fn main() {
-    let mut a = Agent { pos: Vec2::new(-5.0, 0.3), vel: Vec2::ZERO, radius: RADIUS, avoids: true };
-    let mut b = Agent { pos: Vec2::new(5.0, -0.3), vel: Vec2::ZERO, radius: RADIUS, avoids: true };
+    let mut a =
+        Agent { pos: Vec2::new(-5.0, 0.3), vel: Vec2::ZERO, radius: RADIUS, avoids: true, priority: 1.0 };
+    let mut b =
+        Agent { pos: Vec2::new(5.0, -0.3), vel: Vec2::ZERO, radius: RADIUS, avoids: true, priority: 1.0 };
 
     let (goal_a, goal_b) = (Vec2::new(5.0, 0.0), Vec2::new(-5.0, 0.0));
     let mut worst_overshoot = 0.0f32;
