@@ -85,6 +85,9 @@ pub struct Crowd {
     /// `neighbour_range` per cell. Rebuilt every solve, so its size is the crowd's and not the ground
     /// the crowd has covered. Lookup only: every candidate list is sorted before use.
     cells: Vec<(u64, usize)>,
+    /// Whether [`steers`] holds for each member, filled in the same pass as the grid. A neighbour's
+    /// `avoids` is read from here, so the test runs once per member and not once per neighbour offered.
+    steered: Vec<bool>,
     /// Reused candidate buffer: `(distance, key, index)`, cut to the nearest `max_neighbours` and sorted
     /// nearest-first before use.
     near: Vec<(f32, u64, usize)>,
@@ -210,8 +213,10 @@ impl Crowd {
         // member with no usable state has no velocity obstacle, so it is left out here rather than
         // taking a neighbour's place only to be skipped by the solver.
         self.cells.clear();
+        self.steered.clear();
         if search {
             for (i, m) in members.iter().enumerate() {
+                self.steered.push(steers(m));
                 if !usable_state(m.pos, m.vel, m.radius) {
                     continue;
                 }
@@ -278,7 +283,7 @@ impl Crowd {
                     radius: other.radius,
                     // A member this step will not move is not assumed to step aside, so this one
                     // takes the full avoidance against it instead of walking through it.
-                    avoids: steers(&other),
+                    avoids: self.steered.get(j).is_some_and(|&steered| steered),
                 });
             }
 
